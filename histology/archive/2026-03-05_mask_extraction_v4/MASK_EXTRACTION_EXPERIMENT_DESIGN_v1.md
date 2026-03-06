@@ -3,6 +3,19 @@
 ## 0. Purpose
 Build reproducible coronal-section tissue masks from Nissl slides, with fixed v4 defaults, full traceability, and QC storyboard outputs.
 
+## 0.5 Optional whole-slide NDPI extension
+When the input is a NanoZoomer whole-slide (`.ndpi`) rather than an already cropped slice image, do not send the WSI directly into Step1-9. Use a pre-step whole-slide review workflow first:
+
+1. Parse expected section IDs from the filename.
+2. Read the smallest main pyramid level for whole-slide overview proposal.
+3. Detect candidate slice regions on the overview image.
+4. Map accepted boxes back to level-0 coordinates.
+5. Export per-slice review crops, masks, RGBA cutouts, and QC panels.
+6. If needed, re-export accepted ROIs and feed them into the original cropped-slice v4 workflow.
+
+Current review script:
+- `histology/tools/run_ndpi_review_experiment.py`
+
 ## 1. Fixed v4 policy (do not change unless explicitly requested)
 1) Gaussian branch only (`bilateral` disabled by default)
 2) Threshold stage uses only `global_otsu` + `local_sauvola`
@@ -15,6 +28,7 @@ Build reproducible coronal-section tissue masks from Nissl slides, with fixed v4
 
 ## 2. Data and output layout
 - Input raw slides: `C:/Users/Siqi/Desktop/test slices/*.jpg`
+- Optional whole-slide input: `*.ndpi`
 - Main run outputs:
   - `step1_v4_gaussian_wide`
   - `step2_v4_gaussian_wide`
@@ -27,6 +41,7 @@ Build reproducible coronal-section tissue masks from Nissl slides, with fixed v4
   - `step9QC`
 
 ## 3. Script inventory (all scripts used in v4)
+0. `histology/tools/run_ndpi_review_experiment.py` (optional whole-slide NDPI review/proposal)
 1. `step1白平衡/背景校正/run_step1_wb_bg.py`
 2. `step2转换lab/run_step2_to_lab.py`
 3. `step3轻度去噪_bchannel/run_step3_denoise_b.py`
@@ -39,6 +54,64 @@ Build reproducible coronal-section tissue masks from Nissl slides, with fixed v4
 10. `scripts/run_v4_pipeline.sh` (new orchestration entry)
 
 ## 4. Step-by-step logic and parameters
+
+### Step0 (optional): NDPI whole-slide proposal + review mask
+- Scope:
+  - use only when source data are whole-slide NanoZoomer scans
+  - Step1-9 remain unchanged for accepted cropped ROIs
+- Current status:
+  - fixed baseline for routine review: `baseline_v1`
+  - experimental prototype branch: `soft_support_mgac`
+- Logic:
+  - parse stain/sample/section IDs from filename metadata
+  - use the smallest main pyramid level as overview image
+  - detect candidate slice components from overview saturation + nonwhite score
+  - merge horizontally adjacent overview components when one slice is split by thresholding
+  - assign section IDs by mount order: left-to-right on first row, then left-to-right on second row
+  - map candidate boxes back to level-0 coordinates
+  - export review crops plus per-crop review masks
+- Baseline `baseline_v1` crop-mask logic:
+  - detect border-touching artifacts on the crop
+  - build a coarse large-blur silhouette from stain-aware foreground score
+  - expand to lightly stained edge pixels by local score grow
+  - keep the largest connected component and fill holes
+- Stain-aware score note:
+  - `nissl`: emphasize saturation + nonwhite tissue signal
+  - `gallyas`: emphasize grayscale darkness/nonwhite signal because myelin slides are effectively low-saturation
+- Experimental `soft_support_mgac` logic:
+  - start from the same overview proposal and crop extraction
+  - create ownership-guided soft support
+  - initialize a permissive crop candidate
+  - run downsampled morphological geodesic active contour for shrink-to-boundary refinement
+- Key outputs:
+  - overview image
+  - overview candidate boxes
+  - per-crop RGB images
+  - per-crop `score`, `artifact`, `blur`, `mask`, `overlay`, `RGBA`
+  - candidate summary CSV with level-0 bbox coordinates
+
+### Step0.1 Failure analysis summary
+- Main failure mode is target-selection failure, not simple threshold failure.
+- Close-contact artifacts include:
+  - glass-edge bands touching the crop border
+  - neighboring mounted sections entering the crop from top/bottom
+  - dark cross/marker structures on slide hardware attracting the seed/component selection
+  - dirty background structures with contrast similar to tissue edge
+- This means:
+  - heuristic morphology alone is insufficient in some crops
+  - contour methods also fail if initialized from the wrong target support
+  - parameter sweeps can shift under/over-segmentation, but do not fully solve wrong-target selection
+
+### Step0.2 Registration-oriented requirements
+- The segmentation target is used for downstream registration to corresponding myelin sections.
+- Therefore:
+  - edge quality and smoothness matter, not only foreground coverage
+  - masks should preserve gross coronal outline without border tails or neighboring-section bleed
+  - questionable cases should be explicitly flagged for manual review/intervention
+- Recommended operational policy:
+  - use `baseline_v1` for current batch review and manual correction triage
+  - use QC flags and overlay review to identify slices needing manual mask cleanup before registration
+  - treat orientation handling as a separate pre-registration step; left-right mirrored mounting should not be assumed consistent across slides
 
 ### Step1: White balance + background correction
 - Logic:
