@@ -47,6 +47,14 @@ class CandidateBox:
     touches_border: bool
     section: Optional[SectionLabel] = None
     overview_mask: Optional[np.ndarray] = None
+    row_index: int = 0
+    row_bbox_height_outlier: bool = False
+    proposal_area_outlier: bool = False
+    height_ratio_to_row_median: float = 1.0
+    area_ratio_to_row_median: float = 1.0
+    nissl_prior_label: str = ""
+    nissl_prior_slide: str = ""
+    nissl_prior_used: bool = False
 
     def as_bbox(self) -> Tuple[int, int, int, int]:
         return self.x, self.y, self.w, self.h
@@ -103,6 +111,17 @@ def collect_slide_inventory(input_dir: Path) -> List[dict]:
             }
         )
     return rows
+
+
+def build_section_to_slide_index(input_dir: Path) -> dict:
+    index = {}
+    for path in sorted(input_dir.glob("*.ndpi")):
+        if path.name.startswith("._"):
+            continue
+        stain, labels = parse_slide_stem(path.stem)
+        for label in labels:
+            index[(stain.lower(), label.sample_id, label.section_id)] = path
+    return index
 
 
 def overview_level(slide: openslide.OpenSlide) -> int:
@@ -165,9 +184,14 @@ def component_mask_from_overview(overview_rgb: np.ndarray, stain: str) -> Tuple[
     inv_gray = (255 - gray).astype(np.uint8)
 
     if stain.lower() == "gallyas":
-        score = np.maximum(inv_gray, nonwhite)
-        score_thresh = max(int(threshold_otsu(score)), 18)
-        raw = (score > score_thresh).astype(np.uint8) * 255
+        bg_sigma = max(25, int(round(min(overview_rgb.shape[:2]) * 0.03)))
+        bg_sigma = float(odd_kernel(bg_sigma, minimum=25))
+        bg = cv2.GaussianBlur(gray, (0, 0), sigmaX=bg_sigma, sigmaY=bg_sigma)
+        resid = np.clip(bg.astype(np.int16) - gray.astype(np.int16), 0, 255).astype(np.uint8)
+        score_thresh = max(int(threshold_otsu(resid)), 12)
+        raw = (resid > score_thresh).astype(np.uint8) * 255
+        raw = cv2.morphologyEx(raw, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        raw = cv2.morphologyEx(raw, cv2.MORPH_CLOSE, np.ones((11, 11), np.uint8))
     else:
         sat_thresh = max(int(threshold_otsu(sat)), 12)
         nonwhite_thresh = max(int(threshold_otsu(nonwhite)), 20)
@@ -176,6 +200,91 @@ def component_mask_from_overview(overview_rgb: np.ndarray, stain: str) -> Tuple[
     opened = cv2.morphologyEx(raw, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     cleaned = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
     return sat, nonwhite, cleaned
+
+
+def build_support_mask(mask: np.ndarray) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
+    h, w = mask.shape[:2]
+    mask_u8 = (mask > 0).astype(np.uint8) * 255
+    if mask_u8.max() == 0:
+        return np.zeros((h, w), dtype=bool), (0, 0, 0, 0)
+
+    close_k = odd_kernel(int(round(min(h, w) * 0.01)), minimum=5)
+    dilate_k = odd_kernel(int(round(min(h, w) * 0.015)), minimum=9)
+    support = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, np.ones((close_k, close_k), np.uint8))
+    support = cv2.dilate(support, np.ones((dilate_k, dilate_k), np.uint8), iterations=1)
+
+    contours, _ = cv2.findContours(support, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        pts = np.vstack(contours)
+        hull = cv2.convexHull(pts)
+        hull_mask = np.zeros_like(mask_u8)
+        cv2.fillConvexPoly(hull_mask, hull, 255)
+        support = hull_mask
+
+    x, y, bw, bh = cv2.boundingRect(support)
+    return support > 0, (int(x), int(y), int(bw), int(bh))
+
+
+def split_candidates_into_rows(candidates: Sequence[CandidateBox]) -> List[List[CandidateBox]]:
+    ordered = sorted(candidates, key=lambda c: (c.cy, c.cx))
+    if len(ordered) <= 1:
+        return [ordered]
+    top_count = math.ceil(len(ordered) / 2)
+    top_row = sorted(ordered[:top_count], key=lambda c: c.cx)
+    bottom_row = sorted(ordered[top_count:], key=lambda c: c.cx)
+    rows = [top_row]
+    if bottom_row:
+        rows.append(bottom_row)
+    return rows
+
+
+def regularize_candidates_by_row(candidates: Sequence[CandidateBox]) -> List[CandidateBox]:
+    rows = split_candidates_into_rows(candidates)
+    regularized: List[CandidateBox] = []
+    for row_idx, row in enumerate(rows, start=1):
+        if not row:
+            continue
+        tops = np.array([cand.y for cand in row], dtype=np.float32)
+        bottoms = np.array([cand.y + cand.h for cand in row], dtype=np.float32)
+        heights = np.array([cand.h for cand in row], dtype=np.float32)
+        areas = np.array([cand.area for cand in row], dtype=np.float32)
+        row_top = float(np.median(tops))
+        row_bottom = float(np.median(bottoms))
+        row_height = max(1.0, row_bottom - row_top)
+        median_area = max(1.0, float(np.median(areas)))
+
+        for cand in row:
+            height_ratio = cand.h / row_height
+            area_ratio = cand.area / median_area
+            height_outlier = height_ratio < 0.85 or cand.y > row_top + row_height * 0.08 or (cand.y + cand.h) < row_bottom - row_height * 0.08
+            area_outlier = area_ratio < 0.75
+
+            y1 = min(cand.y, int(round(row_top)))
+            y2 = max(cand.y + cand.h, int(round(row_bottom)))
+            if not height_outlier:
+                y1 = cand.y
+                y2 = cand.y + cand.h
+
+            out = CandidateBox(
+                candidate_rank=cand.candidate_rank,
+                x=cand.x,
+                y=max(0, y1),
+                w=cand.w,
+                h=max(1, y2 - y1),
+                area=cand.area,
+                cx=cand.cx,
+                cy=(max(0, y1) + max(0, y1) + max(1, y2 - y1)) / 2.0,
+                touches_border=cand.touches_border,
+                section=cand.section,
+                overview_mask=cand.overview_mask,
+                row_index=row_idx,
+                row_bbox_height_outlier=height_outlier,
+                proposal_area_outlier=area_outlier,
+                height_ratio_to_row_median=float(height_ratio),
+                area_ratio_to_row_median=float(area_ratio),
+            )
+            regularized.append(out)
+    return regularized
 
 
 def bands_from_projection(proj: np.ndarray, thresh: float) -> List[Tuple[int, int]]:
@@ -251,30 +360,24 @@ def fallback_row_split_candidates(mask: np.ndarray, expected_count: int) -> List
             cluster_mask[y1 + pts_y, pts_x] = 1
             cluster_mask = cv2.morphologyEx(cluster_mask * 255, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)) > 0
             cluster_mask = cv2.morphologyEx(cluster_mask.astype(np.uint8) * 255, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)) > 0
-            cy_pts, cx_pts = np.where(cluster_mask)
+            support_mask, support_bbox = build_support_mask(cluster_mask)
+            cy_pts, cx_pts = np.where(support_mask)
             if cx_pts.size == 0:
                 continue
-            x_lo, x_hi = np.percentile(cx_pts, [0.5, 99.5])
-            y_lo, y_hi = np.percentile(cy_pts, [0.5, 99.5])
-            pad_x = max(4, int(round((x_hi - x_lo) * 0.03)))
-            pad_y = max(4, int(round((y_hi - y_lo) * 0.03)))
-            x_min = max(0, int(math.floor(x_lo)) - pad_x)
-            x_max = min(w, int(math.ceil(x_hi)) + 1 + pad_x)
-            y_min = max(0, int(math.floor(y_lo)) - pad_y)
-            y_max = min(h, int(math.ceil(y_hi)) + 1 + pad_y)
-            area = int(cx_pts.size)
+            x_min, y_min, bw, bh = support_bbox
+            area = int((cluster_mask > 0).sum())
             candidates.append(
                 CandidateBox(
                     candidate_rank=len(candidates) + 1,
                     x=x_min,
                     y=y_min,
-                    w=x_max - x_min,
-                    h=y_max - y_min,
+                    w=bw,
+                    h=bh,
                     area=area,
-                    cx=(x_min + x_max) / 2.0,
-                    cy=(y_min + y_max) / 2.0,
-                    touches_border=(x_min == 0 or y_min == 0 or x_max >= w or y_max >= h),
-                    overview_mask=cluster_mask,
+                    cx=x_min + bw / 2.0,
+                    cy=y_min + bh / 2.0,
+                    touches_border=(x_min == 0 or y_min == 0 or (x_min + bw) >= w or (y_min + bh) >= h),
+                    overview_mask=support_mask,
                 )
             )
     return candidates
@@ -295,18 +398,21 @@ def find_candidate_components(mask: np.ndarray, expected_count: int) -> List[Can
             continue
         if bw < int(round(w * 0.05)) or bh < int(round(h * 0.08)):
             continue
+        raw_mask = labels == idx
+        support_mask, support_bbox = build_support_mask(raw_mask)
+        sx, sy, sw, sh = support_bbox
         candidates.append(
             CandidateBox(
                 candidate_rank=rank,
-                x=x,
-                y=y,
-                w=bw,
-                h=bh,
+                x=sx,
+                y=sy,
+                w=sw,
+                h=sh,
                 area=area,
-                cx=float(cx),
-                cy=float(cy),
+                cx=float(sx + sw / 2.0),
+                cy=float(sy + sh / 2.0),
                 touches_border=touches,
-                overview_mask=(labels == idx),
+                overview_mask=support_mask,
             )
         )
         rank += 1
@@ -315,10 +421,12 @@ def find_candidate_components(mask: np.ndarray, expected_count: int) -> List[Can
     if len(merged) < expected_count:
         fallback = fallback_row_split_candidates(mask, expected_count)
         if len(fallback) >= expected_count:
-            return fallback[:expected_count]
+            merged = fallback[:expected_count]
+        else:
+            merged = merged
     if len(merged) > expected_count:
         merged = merged[:expected_count]
-    return merged
+    return regularize_candidates_by_row(merged)
 
 
 def merge_candidates(candidates: Sequence[CandidateBox], gap_px: int) -> List[CandidateBox]:
@@ -389,10 +497,116 @@ def draw_overview_boxes(overview_rgb: np.ndarray, candidates: Sequence[Candidate
         label = labels[idx].short_label if idx < len(labels) else f"cand_{idx+1}"
         x1, y1 = candidate.x, candidate.y
         x2, y2 = candidate.x + candidate.w, candidate.y + candidate.h
-        draw.rectangle((x1, y1, x2, y2), outline=(255, 0, 0), width=4)
-        draw.rectangle((x1, max(0, y1 - 28), x1 + 180, y1), fill=(0, 0, 0))
-        draw.text((x1 + 6, max(0, y1 - 24)), label, fill=(255, 255, 255))
+        flagged = candidate.row_bbox_height_outlier or candidate.proposal_area_outlier
+        box_color = (255, 180, 0) if flagged else (255, 0, 0)
+        tag = f"{label} !" if flagged else label
+        draw.rectangle((x1, y1, x2, y2), outline=box_color, width=4)
+        draw.rectangle((x1, max(0, y1 - 28), x1 + 220, y1), fill=(0, 0, 0))
+        draw.text((x1 + 6, max(0, y1 - 24)), tag, fill=(255, 255, 255))
     return np.asarray(canvas)
+
+
+def load_slide_candidates_for_prior(slide_path: Path, expected_labels: Sequence[SectionLabel], cache: dict) -> Tuple[Tuple[int, int], List[CandidateBox]]:
+    cache_key = str(slide_path)
+    if cache_key in cache:
+        return cache[cache_key]
+
+    slide = openslide.OpenSlide(str(slide_path))
+    overview_rgb = read_overview(slide)
+    stain, _ = parse_slide_stem(slide_path.stem)
+    _, _, component_mask = component_mask_from_overview(overview_rgb, stain=stain)
+    candidates = find_candidate_components(component_mask, len(expected_labels))
+    candidates = assign_sections(candidates, expected_labels)
+    out = (overview_rgb.shape[1::-1], candidates)
+    cache[cache_key] = out
+    return out
+
+
+def apply_nissl_guided_proposal_prior(
+    candidates: Sequence[CandidateBox],
+    stain: str,
+    nissl_root: Optional[Path],
+    nissl_index: Optional[dict],
+    prior_cache: dict,
+    overview_shape_wh: Tuple[int, int],
+) -> List[CandidateBox]:
+    if stain.lower() != "gallyas" or nissl_root is None or nissl_index is None:
+        return list(candidates)
+
+    out: List[CandidateBox] = []
+    for cand in candidates:
+        if cand.section is None:
+            out.append(cand)
+            continue
+
+        matched_key = None
+        matched_label = ""
+        for delta in (1, -1):
+            key = ("nissl", cand.section.sample_id, cand.section.section_id + delta)
+            if key in nissl_index:
+                matched_key = key
+                matched_label = f"{cand.section.sample_id}_{cand.section.section_id + delta}"
+                break
+
+        if matched_key is None:
+            out.append(cand)
+            continue
+
+        prior_slide = nissl_index[matched_key]
+        prior_stain, prior_labels = parse_slide_stem(prior_slide.stem)
+        prior_dims, prior_candidates = load_slide_candidates_for_prior(prior_slide, prior_labels, prior_cache)
+        prior_match = next((p for p in prior_candidates if p.section and p.section.short_label == matched_label), None)
+        if prior_match is None:
+            out.append(cand)
+            continue
+
+        current_w, current_h = overview_shape_wh
+        prior_w, prior_h = prior_dims
+        sx = current_w / max(prior_w, 1)
+        sy = current_h / max(prior_h, 1)
+        target_w = int(round(prior_match.w * sx))
+        target_h = int(round(prior_match.h * sy))
+
+        use_prior = cand.w < int(round(target_w * 0.88)) or cand.h < int(round(target_h * 0.88))
+        if not use_prior:
+            cand.nissl_prior_label = matched_label
+            cand.nissl_prior_slide = prior_slide.name
+            out.append(cand)
+            continue
+
+        cx = cand.x + cand.w / 2.0
+        bottom = cand.y + cand.h
+        new_w = max(cand.w, int(round(target_w * 1.03)))
+        new_h = max(cand.h, int(round(target_h * 1.03)))
+        new_x = max(0, int(round(cx - new_w / 2.0)))
+        new_y = max(0, int(round(bottom - new_h)))
+        new_x2 = min(current_w, new_x + new_w)
+        new_y2 = min(current_h, new_y + new_h)
+
+        updated = CandidateBox(
+            candidate_rank=cand.candidate_rank,
+            x=new_x,
+            y=new_y,
+            w=max(1, new_x2 - new_x),
+            h=max(1, new_y2 - new_y),
+            area=cand.area,
+            cx=new_x + max(1, new_x2 - new_x) / 2.0,
+            cy=new_y + max(1, new_y2 - new_y) / 2.0,
+            touches_border=cand.touches_border,
+            section=cand.section,
+            overview_mask=cand.overview_mask,
+            row_index=cand.row_index,
+            row_bbox_height_outlier=cand.row_bbox_height_outlier,
+            proposal_area_outlier=cand.proposal_area_outlier,
+            height_ratio_to_row_median=cand.height_ratio_to_row_median,
+            area_ratio_to_row_median=cand.area_ratio_to_row_median,
+            nissl_prior_label=matched_label,
+            nissl_prior_slide=prior_slide.name,
+            nissl_prior_used=True,
+        )
+        out.append(updated)
+
+    return out
 
 
 def convert_bbox_to_level0(slide: openslide.OpenSlide, candidate: CandidateBox, pad_overview: int) -> Tuple[int, int, int, int]:
@@ -751,8 +965,50 @@ def build_crop_mask_baseline(
     target_center_px: Tuple[float, float],
     stain: str,
 ) -> dict:
+    stain_key = stain.lower()
     score, channels = compute_stain_score(crop_rgb, stain)
     artifact = detect_border_artifacts(score, channels["nonwhite"], channels["sat"])
+
+    if stain_key == "gallyas":
+        gray = channels["gray"]
+        h, w = gray.shape[:2]
+        bg_sigma = max(35, int(round(min(h, w) * 0.03)))
+        bg_sigma = float(odd_kernel(bg_sigma, minimum=35))
+        bg = cv2.GaussianBlur(gray, (0, 0), sigmaX=bg_sigma, sigmaY=bg_sigma)
+        resid = np.clip(bg.astype(np.int16) - gray.astype(np.int16), 0, 255).astype(np.uint8)
+
+        support_soft_k = odd_kernel(int(round(min(h, w) * 0.02)), minimum=31)
+        support_soft = cv2.dilate(support_mask.astype(np.uint8) * 255, np.ones((support_soft_k, support_soft_k), np.uint8)) > 0
+
+        score_clean = resid.copy()
+        score_clean[artifact > 0] = 0
+        score_clean[~support_soft] = 0
+        blur = cv2.GaussianBlur(score_clean, (0, 0), sigmaX=max(9, min(h, w) * 0.01), sigmaY=max(9, min(h, w) * 0.01))
+        blur_vals = blur[support_soft]
+        blur_thresh = int(threshold_otsu(blur_vals.astype(np.uint8))) if blur_vals.size else int(threshold_otsu(blur))
+        candidate = (blur >= blur_thresh) & support_soft & (artifact == 0)
+        open_k = odd_kernel(int(round(min(h, w) * 0.003)), minimum=5)
+        close_k = odd_kernel(int(round(min(h, w) * 0.012)), minimum=25)
+        candidate = cv2.morphologyEx(candidate.astype(np.uint8) * 255, cv2.MORPH_OPEN, np.ones((open_k, open_k), np.uint8)) > 0
+        candidate = cv2.morphologyEx(candidate.astype(np.uint8) * 255, cv2.MORPH_CLOSE, np.ones((close_k, close_k), np.uint8)) > 0
+        candidate &= support_soft
+        candidate = binary_fill_holes(candidate)
+        candidate = select_component_by_point(candidate, target_center_px) > 0
+
+        local_sigma = max(5, int(round(min(h, w) * 0.006)))
+        local_sigma = float(odd_kernel(local_sigma, minimum=5))
+        local = cv2.GaussianBlur(score_clean, (0, 0), sigmaX=local_sigma, sigmaY=local_sigma)
+        interior = local[candidate > 0]
+        grow_thresh = max(6, int(np.quantile(interior, 0.18) * 0.82)) if interior.size else 6
+        grow_k = odd_kernel(int(round(min(h, w) * 0.004)), minimum=7)
+        grown = cv2.dilate(candidate.astype(np.uint8) * 255, np.ones((grow_k, grow_k), np.uint8)) > 0
+        final = grown & (local >= grow_thresh) & support_soft & (artifact == 0)
+        final |= candidate
+        final = cv2.morphologyEx(final.astype(np.uint8) * 255, cv2.MORPH_CLOSE, np.ones((odd_kernel(int(round(min(h, w) * 0.006)), minimum=11),) * 2, np.uint8)) > 0
+        final = binary_fill_holes(final)
+        final = select_component_by_point(final, target_center_px) > 0
+        core = candidate.copy()
+        return finalize_mask_metrics(final > 0, ownership_strict, resid, artifact, candidate > 0, core > 0, blur.astype(np.uint8))
 
     score_clean = score.copy()
     score_clean[artifact > 0] = 0
@@ -767,7 +1023,7 @@ def build_crop_mask_baseline(
     candidate = cv2.morphologyEx(candidate.astype(np.uint8) * 255, cv2.MORPH_OPEN, np.ones((open_k, open_k), np.uint8)) > 0
     candidate = cv2.morphologyEx(candidate.astype(np.uint8) * 255, cv2.MORPH_CLOSE, np.ones((close_k, close_k), np.uint8)) > 0
     candidate = binary_fill_holes(candidate)
-    candidate = largest_component(candidate)
+    candidate = largest_component(candidate) > 0
 
     local_sigma = max(3, int(round(min(crop_rgb.shape[:2]) * 0.004)))
     local = cv2.GaussianBlur(score_clean, (0, 0), sigmaX=local_sigma, sigmaY=local_sigma)
@@ -963,6 +1219,14 @@ def write_candidate_csv(path: Path, rows: Sequence[dict]) -> None:
         "overview_w",
         "overview_h",
         "overview_area",
+        "proposal_row_index",
+        "proposal_height_ratio_to_row_median",
+        "proposal_area_ratio_to_row_median",
+        "row_bbox_height_outlier",
+        "proposal_area_outlier",
+        "nissl_prior_label",
+        "nissl_prior_slide",
+        "nissl_prior_used",
         "level0_x",
         "level0_y",
         "level0_w",
@@ -999,6 +1263,7 @@ def write_experiment_note(
     crop_level: int,
     detected_count: int,
     mask_method: str,
+    nissl_prior_root: str,
 ) -> None:
     lines = [
         "# NDPI Whole-Slide Review Experiment",
@@ -1010,6 +1275,7 @@ def write_experiment_note(
         f"- Detected candidate count: {detected_count}",
         f"- Crop export level: `{crop_level}`",
         f"- Mask method: `{mask_method}`",
+        f"- Nissl prior root: `{nissl_prior_root}`" if nissl_prior_root else "- Nissl prior root: ``",
         "",
         "## Working Assumptions",
         "",
@@ -1043,15 +1309,19 @@ def main() -> None:
     parser.add_argument("--slide-name", default="")
     parser.add_argument("--crop-level", type=int, default=3)
     parser.add_argument("--mask-method", default="baseline_v1")
+    parser.add_argument("--nissl-prior-root", default="")
     args = parser.parse_args()
 
     input_dir = Path(args.input_dir)
     review_root = Path(args.review_root)
     ensure_dir(review_root)
+    nissl_prior_root = Path(args.nissl_prior_root) if args.nissl_prior_root else None
 
     inventory_rows = collect_slide_inventory(input_dir)
     if not inventory_rows:
         raise SystemExit(f"No NDPI files found in {input_dir}")
+    nissl_index = build_section_to_slide_index(nissl_prior_root) if nissl_prior_root else None
+    prior_cache = {}
 
     slide_paths = [Path(row["slide_path"]) for row in inventory_rows]
     if args.slide_name:
@@ -1093,6 +1363,7 @@ def main() -> None:
         "expected_labels": [asdict(label) for label in expected_labels],
         "seed": args.seed,
         "crop_level": args.crop_level,
+        "nissl_prior_root": str(nissl_prior_root) if nissl_prior_root else "",
         "slide_dimensions": slide.dimensions,
         "level_dimensions": slide.level_dimensions,
         "level_downsamples": list(slide.level_downsamples),
@@ -1115,6 +1386,14 @@ def main() -> None:
 
     candidates = find_candidate_components(component_mask, len(expected_labels))
     candidates = assign_sections(candidates, expected_labels)
+    candidates = apply_nissl_guided_proposal_prior(
+        candidates,
+        stain=stain,
+        nissl_root=nissl_prior_root,
+        nissl_index=nissl_index,
+        prior_cache=prior_cache,
+        overview_shape_wh=overview_rgb.shape[1::-1],
+    )
     print(f"[candidates] expected={len(expected_labels)} detected={len(candidates)}", flush=True)
 
     boxed = draw_overview_boxes(overview_rgb, candidates, expected_labels)
@@ -1212,6 +1491,14 @@ def main() -> None:
             "overview_w": candidate.w,
             "overview_h": candidate.h,
             "overview_area": candidate.area,
+            "proposal_row_index": candidate.row_index,
+            "proposal_height_ratio_to_row_median": f"{candidate.height_ratio_to_row_median:.6f}",
+            "proposal_area_ratio_to_row_median": f"{candidate.area_ratio_to_row_median:.6f}",
+            "row_bbox_height_outlier": str(candidate.row_bbox_height_outlier),
+            "proposal_area_outlier": str(candidate.proposal_area_outlier),
+            "nissl_prior_label": candidate.nissl_prior_label,
+            "nissl_prior_slide": candidate.nissl_prior_slide,
+            "nissl_prior_used": str(candidate.nissl_prior_used),
             "level0_x": bbox_level0[0],
             "level0_y": bbox_level0[1],
             "level0_w": bbox_level0[2],
@@ -1247,6 +1534,7 @@ def main() -> None:
         crop_level=args.crop_level,
         detected_count=len(candidates),
         mask_method=args.mask_method,
+        nissl_prior_root=str(nissl_prior_root) if nissl_prior_root else "",
     )
 
     manifest = {

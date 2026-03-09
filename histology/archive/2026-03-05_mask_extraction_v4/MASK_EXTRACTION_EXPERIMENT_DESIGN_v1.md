@@ -62,6 +62,8 @@ Current review script:
 - Current status:
   - fixed baseline for routine review: `baseline_v1`
   - experimental prototype branch: `soft_support_mgac`
+  - note: `baseline_v1` is stain-aware and contains separate Nissl and Gallyas branches; Gallyas adaptation does not replace the Nissl path
+  - optional Gallyas enhancement: `Nissl-guided proposal prior` using matched or adjacent (`+/-1`) Nissl sections when available
 - Logic:
   - parse stain/sample/section IDs from filename metadata
   - use the smallest main pyramid level as overview image
@@ -78,6 +80,11 @@ Current review script:
 - Stain-aware score note:
   - `nissl`: emphasize saturation + nonwhite tissue signal
   - `gallyas`: emphasize grayscale darkness/nonwhite signal because myelin slides are effectively low-saturation
+  - implementation policy: keep these as separate stain-specific branches inside the same tool, with no cross-overwriting of thresholds/scores
+- Gallyas proposal prior note:
+  - if a corresponding Nissl section is available, the Gallyas proposal stage can borrow Nissl-derived bbox size priors
+  - section matching uses same sample ID and nearest adjacent section number (`+1` preferred, then `-1`)
+  - prior is used as a size prior, not as an absolute position prior, to avoid mounting-layout mismatch across slides
 - Experimental `soft_support_mgac` logic:
   - start from the same overview proposal and crop extraction
   - create ownership-guided soft support

@@ -1,0 +1,7 @@
+.venv/
+logs/
+workspace_example/db/
+tmp_windows_import_check.py
+
+__pycache__/
+*.pyc
