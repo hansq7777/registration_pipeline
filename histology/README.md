@@ -17,6 +17,22 @@ Contents:
   - GUI design for human-guided proposal review, mask correction, orientation selection, pairing review, and export management
 - `HUMAN_IN_THE_LOOP_HISTOLOGY_GUI_DEV_SPEC_v1.md`
   - implementation-oriented GUI specification: schema, modules, state machine, files, and export contracts
+- `WINDOWS_TIMING_HARNESS_REFERENCE_v1.md`
+  - reference for Windows-side GUI timing methodology, anti-patterns, and benchmark workflow
+- `REVIEW_EXPERIMENT_SUMMARY_20260311.md`
+  - condensed summary of the March whole-slide, myelin mask, bbox, low-resolution GUI, and export-efficiency experiments
+- `GT_BACKED_EVALUATION_PROTOCOL_v1.md`
+  - canonical GT sources, slide-space bbox evaluation rule, and current GT-backed bbox/mask benchmark conclusions
+- `MYELIN_MASK_GT_STRATEGY_SEARCH_20260311.md`
+  - GT-backed crop-mask strategy search for myelin sections, including boundary/leakage tradeoffs and current top 3 candidates
+- `MYELIN_BBOX_GT_STRATEGY_SEARCH_20260311.md`
+  - GT-backed myelin bbox proposal search comparing slide-space proposal rectangles against hand crop boxes and GT masks, with relaxed top-biased projection selected as the new best default
+- `MYELIN_BBOX_WEIGHTED_GT_SEARCH_20260312.md`
+  - weighted GT-backed myelin bbox search using `50%` target coverage, `30%` non-target avoidance, and `20%` compactness, with compact hybrid proposal selected as the new weighted-default candidate
+- `NISSL_BBOX_GT_SEARCH_20260311.md`
+  - GT-backed Nissl bbox search showing that full coverage is already saturated and that smaller uniform pads are the only meaningful optimization direction
+- `NISSL_MASK_GT_STRATEGY_SEARCH_20260311.md`
+  - GT-backed Nissl crop-mask strategy search comparing GUI and experiment-script paths, with the experiment baseline selected as the new best default
 - `gui_mvp/`
   - SQLite schema, Python data models, directory conventions, and PySide6 GUI MVP skeleton
 - `archive/2026-03-05_mask_extraction_v4/`

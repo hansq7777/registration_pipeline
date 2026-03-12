@@ -225,6 +225,193 @@ def build_support_mask(mask: np.ndarray) -> Tuple[np.ndarray, Tuple[int, int, in
     return support > 0, (int(x), int(y), int(bw), int(bh))
 
 
+def clamp_rect(x1: int, y1: int, x2: int, y2: int, shape_wh: Tuple[int, int]) -> Tuple[int, int, int, int]:
+    w, h = shape_wh
+    x1 = max(0, min(w - 1, int(round(x1))))
+    y1 = max(0, min(h - 1, int(round(y1))))
+    x2 = max(x1 + 1, min(w, int(round(x2))))
+    y2 = max(y1 + 1, min(h, int(round(y2))))
+    return x1, y1, x2, y2
+
+
+def union_rect(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int], shape_wh: Tuple[int, int]) -> Tuple[int, int, int, int]:
+    return clamp_rect(min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]), shape_wh)
+
+
+def expand_candidate_rect(
+    candidate: CandidateBox,
+    overview_shape_wh: Tuple[int, int],
+    *,
+    left_ratio: float,
+    top_ratio: float,
+    right_ratio: float,
+    bottom_ratio: float,
+    min_pad: int = 24,
+) -> Tuple[int, int, int, int]:
+    base = float(max(candidate.w, candidate.h))
+    pl = max(min_pad, int(round(base * left_ratio)))
+    pt = max(min_pad, int(round(base * top_ratio)))
+    pr = max(min_pad, int(round(base * right_ratio)))
+    pb = max(min_pad, int(round(base * bottom_ratio)))
+    return clamp_rect(
+        candidate.x - pl,
+        candidate.y - pt,
+        candidate.x + candidate.w + pr,
+        candidate.y + candidate.h + pb,
+        overview_shape_wh,
+    )
+
+
+def smooth1d(arr: np.ndarray, ksize: int = 9) -> np.ndarray:
+    if arr.size == 0:
+        return arr.astype(np.float32)
+    if ksize % 2 == 0:
+        ksize += 1
+    vec = arr.astype(np.float32)[None, :, None]
+    return cv2.GaussianBlur(vec, (1, ksize), 0).reshape(-1)
+
+
+def contiguous_expand(signal: np.ndarray, threshold: float, max_gap: int = 3) -> int:
+    if signal.size == 0:
+        return 0
+    expand = 0
+    gap = 0
+    for idx in range(signal.size - 1, -1, -1):
+        if signal[idx] >= threshold:
+            expand = signal.size - idx
+            gap = 0
+        else:
+            gap += 1
+            if gap >= max_gap:
+                break
+    return int(expand)
+
+
+def gallyas_overview_residual(overview_rgb: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(overview_rgb, cv2.COLOR_RGB2GRAY)
+    bg_sigma = max(25, int(round(min(overview_rgb.shape[:2]) * 0.03)))
+    bg_sigma = float(odd_kernel(bg_sigma, minimum=25))
+    bg = cv2.GaussianBlur(gray, (0, 0), sigmaX=bg_sigma, sigmaY=bg_sigma)
+    return np.clip(bg.astype(np.int16) - gray.astype(np.int16), 0, 255).astype(np.uint8)
+
+
+def gallyas_overview_hybrid_score(overview_rgb: np.ndarray) -> np.ndarray:
+    residual = gallyas_overview_residual(overview_rgb)
+    legacy_score, _ = compute_stain_score(overview_rgb, "gallyas")
+    legacy_score = cv2.GaussianBlur(legacy_score, (0, 0), sigmaX=1.2, sigmaY=1.2).astype(np.uint8)
+    return np.maximum(residual, legacy_score).astype(np.uint8)
+
+
+def projection_expand_rect(
+    candidate: CandidateBox,
+    overview_score: np.ndarray,
+    overview_shape_wh: Tuple[int, int],
+    *,
+    top_cap_ratio: float = 0.30,
+    bottom_cap_ratio: float = 0.14,
+    side_cap_ratio: float = 0.10,
+    span_margin_ratio: float = 0.08,
+    top_only: bool = False,
+    thresh_scale: float = 0.42,
+    max_gap: int = 3,
+) -> Tuple[int, int, int, int]:
+    h_img, w_img = overview_score.shape[:2]
+    x1 = max(0, candidate.x)
+    y1 = max(0, candidate.y)
+    x2 = min(w_img, candidate.x + candidate.w)
+    y2 = min(h_img, candidate.y + candidate.h)
+    if x2 <= x1 or y2 <= y1:
+        return expand_candidate_rect(
+            candidate,
+            overview_shape_wh,
+            left_ratio=0.08,
+            top_ratio=0.08,
+            right_ratio=0.08,
+            bottom_ratio=0.08,
+        )
+
+    pad_base = max(24, int(round(max(candidate.w, candidate.h) * 0.08)))
+    x1b, y1b, x2b, y2b = clamp_rect(x1 - pad_base, y1 - pad_base, x2 + pad_base, y2 + pad_base, overview_shape_wh)
+    inside = overview_score[y1:y2, x1:x2]
+    inside_vals = inside[inside > 0]
+    if inside_vals.size == 0:
+        return x1b, y1b, x2b, y2b
+    thresh = max(6.0, float(np.quantile(inside_vals, 0.18)) * thresh_scale)
+
+    span_x = max(12, int(round(candidate.w * span_margin_ratio)))
+    col1 = max(0, x1 - span_x)
+    col2 = min(w_img, x2 + span_x)
+    top_cap = max(0, int(round(candidate.h * top_cap_ratio)))
+    bottom_cap = max(0, int(round(candidate.h * bottom_cap_ratio)))
+    side_cap = max(0, int(round(candidate.w * side_cap_ratio)))
+
+    add_top = 0
+    if top_cap > 0 and y1 > 0:
+        patch = overview_score[max(0, y1 - top_cap) : y1, col1:col2]
+        if patch.size > 0:
+            signal = smooth1d(np.quantile(patch, 0.85, axis=1))
+            add_top = contiguous_expand(signal, thresh, max_gap=max_gap)
+
+    add_bottom = 0
+    add_left = 0
+    add_right = 0
+    if not top_only:
+        if bottom_cap > 0 and y2 < h_img:
+            patch = overview_score[y2 : min(h_img, y2 + bottom_cap), col1:col2]
+            if patch.size > 0:
+                signal = smooth1d(np.quantile(patch, 0.85, axis=1))
+                add_bottom = contiguous_expand(signal, thresh, max_gap=max_gap)
+        span_y = max(12, int(round(candidate.h * span_margin_ratio)))
+        vrow1 = max(0, y1 - span_y)
+        vrow2 = min(h_img, y2 + span_y)
+        if side_cap > 0 and x1 > 0:
+            patch = overview_score[vrow1:vrow2, max(0, x1 - side_cap) : x1]
+            if patch.size > 0:
+                signal = smooth1d(np.quantile(patch, 0.85, axis=0))
+                add_left = contiguous_expand(signal, thresh, max_gap=max_gap)
+        if side_cap > 0 and x2 < w_img:
+            patch = overview_score[vrow1:vrow2, x2 : min(w_img, x2 + side_cap)]
+            if patch.size > 0:
+                signal = smooth1d(np.quantile(patch, 0.85, axis=0))
+                add_right = contiguous_expand(signal, thresh, max_gap=max_gap)
+
+    return clamp_rect(x1b - add_left, y1b - add_top, x2b + add_right, y2b + add_bottom, overview_shape_wh)
+
+
+def proposal_crop_rect_overview(candidate: CandidateBox, overview_rgb: np.ndarray, stain: str) -> Tuple[int, int, int, int]:
+    overview_shape_wh = overview_rgb.shape[1], overview_rgb.shape[0]
+    if stain.lower() != "gallyas":
+        return expand_candidate_rect(
+            candidate,
+            overview_shape_wh,
+            left_ratio=0.08,
+            top_ratio=0.08,
+            right_ratio=0.08,
+            bottom_ratio=0.08,
+        )
+
+    top_bias = expand_candidate_rect(
+        candidate,
+        overview_shape_wh,
+        left_ratio=0.24,
+        top_ratio=0.24,
+        right_ratio=0.24,
+        bottom_ratio=0.24,
+    )
+    proj = projection_expand_rect(
+        candidate,
+        gallyas_overview_hybrid_score(overview_rgb),
+        overview_shape_wh,
+        top_cap_ratio=0.48,
+        bottom_cap_ratio=0.22,
+        side_cap_ratio=0.18,
+        top_only=False,
+        thresh_scale=0.32,
+        max_gap=6,
+    )
+    return union_rect(top_bias, proj, overview_shape_wh)
+
+
 def split_candidates_into_rows(candidates: Sequence[CandidateBox]) -> List[List[CandidateBox]]:
     ordered = sorted(candidates, key=lambda c: (c.cy, c.cx))
     if len(ordered) <= 1:
@@ -609,13 +796,10 @@ def apply_nissl_guided_proposal_prior(
     return out
 
 
-def convert_bbox_to_level0(slide: openslide.OpenSlide, candidate: CandidateBox, pad_overview: int) -> Tuple[int, int, int, int]:
+def convert_bbox_to_level0(slide: openslide.OpenSlide, crop_rect_overview: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
     level = overview_level(slide)
     downsample = float(slide.level_downsamples[level])
-    x1 = max(0, candidate.x - pad_overview)
-    y1 = max(0, candidate.y - pad_overview)
-    x2 = min(slide.level_dimensions[level][0], candidate.x + candidate.w + pad_overview)
-    y2 = min(slide.level_dimensions[level][1], candidate.y + candidate.h + pad_overview)
+    x1, y1, x2, y2 = crop_rect_overview
     x0 = int(round(x1 * downsample))
     y0 = int(round(y1 * downsample))
     w0 = int(round((x2 - x1) * downsample))
@@ -781,6 +965,98 @@ def select_component_by_point(mask: np.ndarray, point_xy: Tuple[float, float]) -
             best_dist = dist
             best_idx = idx
     return (labels == best_idx).astype(np.uint8)
+
+
+def select_gallyas_components(
+    mask: np.ndarray,
+    point_xy: Tuple[float, float],
+    support_mask: np.ndarray,
+    score_map: np.ndarray,
+    max_components: int = 1,
+    secondary_area_frac_primary: float = 0.18,
+    secondary_area_frac_total: float = 0.06,
+    secondary_support_overlap_min: float = 0.55,
+    secondary_score_frac_primary: float = 0.60,
+) -> np.ndarray:
+    mask_u8 = mask.astype(np.uint8)
+    num, labels, stats, cents = cv2.connectedComponentsWithStats(mask_u8, 8)
+    if num <= 1:
+        return mask_u8
+
+    h, w = mask.shape[:2]
+    px = int(round(point_xy[0]))
+    py = int(round(point_xy[1]))
+    center_x = float(point_xy[0])
+    total_area = max(1, int(mask_u8.sum()))
+
+    components = []
+    for idx in range(1, num):
+        comp = labels == idx
+        area = int(stats[idx, cv2.CC_STAT_AREA])
+        cx, cy = cents[idx]
+        support_overlap = float((comp & support_mask).sum() / max(area, 1))
+        comp_scores = score_map[comp]
+        score_median = float(np.median(comp_scores)) if comp_scores.size else 0.0
+        if cx < center_x - 0.06 * w:
+            side = -1
+        elif cx > center_x + 0.06 * w:
+            side = 1
+        else:
+            side = 0
+        components.append(
+            {
+                "idx": idx,
+                "area": area,
+                "cx": float(cx),
+                "cy": float(cy),
+                "dist2": float((cx - point_xy[0]) ** 2 + (cy - point_xy[1]) ** 2),
+                "support_overlap": support_overlap,
+                "score_median": score_median,
+                "side": side,
+            }
+        )
+
+    hit = 0
+    if 0 <= px < w and 0 <= py < h:
+        hit = int(labels[py, px])
+    if hit > 0:
+        primary_idx = hit
+    else:
+        primary_idx = min(components, key=lambda c: c["dist2"])["idx"]
+
+    keep = {primary_idx}
+    if max_components <= 1:
+        return np.isin(labels, list(keep)).astype(np.uint8)
+
+    primary = next(c for c in components if c["idx"] == primary_idx)
+    min_secondary_area = max(primary["area"] * secondary_area_frac_primary, total_area * secondary_area_frac_total)
+    min_secondary_score = max(6.0, primary["score_median"] * secondary_score_frac_primary)
+
+    secondary_candidates = []
+    for comp in components:
+        if comp["idx"] == primary_idx:
+            continue
+        if comp["area"] < min_secondary_area:
+            continue
+        if comp["support_overlap"] < secondary_support_overlap_min:
+            continue
+        if comp["score_median"] < min_secondary_score:
+            continue
+
+        if primary["side"] == 0:
+            opposite_side = abs(comp["cx"] - center_x) > 0.16 * w
+        else:
+            opposite_side = comp["side"] != 0 and comp["side"] != primary["side"]
+        if not opposite_side:
+            continue
+
+        secondary_candidates.append(comp)
+
+    secondary_candidates.sort(key=lambda c: (-c["area"], c["dist2"]))
+    for comp in secondary_candidates[: max_components - 1]:
+        keep.add(comp["idx"])
+
+    return np.isin(labels, list(keep)).astype(np.uint8)
 
 
 def reconstruct_from_core(candidate: np.ndarray, core: np.ndarray) -> np.ndarray:
@@ -964,6 +1240,15 @@ def build_crop_mask_baseline(
     support_mask: np.ndarray,
     target_center_px: Tuple[float, float],
     stain: str,
+    gallyas_max_components: int = 2,
+    gallyas_support_soft_frac: float = 0.02,
+    gallyas_candidate_thresh_scale: float = 1.0,
+    gallyas_grow_quantile: float = 0.18,
+    gallyas_grow_scale: float = 0.82,
+    gallyas_secondary_area_frac_primary: float = 0.18,
+    gallyas_secondary_area_frac_total: float = 0.06,
+    gallyas_secondary_support_overlap_min: float = 0.55,
+    gallyas_secondary_score_frac_primary: float = 0.60,
 ) -> dict:
     stain_key = stain.lower()
     score, channels = compute_stain_score(crop_rgb, stain)
@@ -977,7 +1262,7 @@ def build_crop_mask_baseline(
         bg = cv2.GaussianBlur(gray, (0, 0), sigmaX=bg_sigma, sigmaY=bg_sigma)
         resid = np.clip(bg.astype(np.int16) - gray.astype(np.int16), 0, 255).astype(np.uint8)
 
-        support_soft_k = odd_kernel(int(round(min(h, w) * 0.02)), minimum=31)
+        support_soft_k = odd_kernel(int(round(min(h, w) * gallyas_support_soft_frac)), minimum=31)
         support_soft = cv2.dilate(support_mask.astype(np.uint8) * 255, np.ones((support_soft_k, support_soft_k), np.uint8)) > 0
 
         score_clean = resid.copy()
@@ -986,27 +1271,48 @@ def build_crop_mask_baseline(
         blur = cv2.GaussianBlur(score_clean, (0, 0), sigmaX=max(9, min(h, w) * 0.01), sigmaY=max(9, min(h, w) * 0.01))
         blur_vals = blur[support_soft]
         blur_thresh = int(threshold_otsu(blur_vals.astype(np.uint8))) if blur_vals.size else int(threshold_otsu(blur))
-        candidate = (blur >= blur_thresh) & support_soft & (artifact == 0)
+        candidate_thresh = max(6, int(round(blur_thresh * gallyas_candidate_thresh_scale)))
+        candidate = (blur >= candidate_thresh) & support_soft & (artifact == 0)
         open_k = odd_kernel(int(round(min(h, w) * 0.003)), minimum=5)
         close_k = odd_kernel(int(round(min(h, w) * 0.012)), minimum=25)
         candidate = cv2.morphologyEx(candidate.astype(np.uint8) * 255, cv2.MORPH_OPEN, np.ones((open_k, open_k), np.uint8)) > 0
         candidate = cv2.morphologyEx(candidate.astype(np.uint8) * 255, cv2.MORPH_CLOSE, np.ones((close_k, close_k), np.uint8)) > 0
         candidate &= support_soft
         candidate = binary_fill_holes(candidate)
-        candidate = select_component_by_point(candidate, target_center_px) > 0
+        candidate = select_gallyas_components(
+            candidate,
+            target_center_px,
+            support_mask=support_mask,
+            score_map=blur,
+            max_components=gallyas_max_components,
+            secondary_area_frac_primary=gallyas_secondary_area_frac_primary,
+            secondary_area_frac_total=gallyas_secondary_area_frac_total,
+            secondary_support_overlap_min=gallyas_secondary_support_overlap_min,
+            secondary_score_frac_primary=gallyas_secondary_score_frac_primary,
+        ) > 0
 
         local_sigma = max(5, int(round(min(h, w) * 0.006)))
         local_sigma = float(odd_kernel(local_sigma, minimum=5))
         local = cv2.GaussianBlur(score_clean, (0, 0), sigmaX=local_sigma, sigmaY=local_sigma)
         interior = local[candidate > 0]
-        grow_thresh = max(6, int(np.quantile(interior, 0.18) * 0.82)) if interior.size else 6
+        grow_thresh = max(6, int(np.quantile(interior, gallyas_grow_quantile) * gallyas_grow_scale)) if interior.size else 6
         grow_k = odd_kernel(int(round(min(h, w) * 0.004)), minimum=7)
         grown = cv2.dilate(candidate.astype(np.uint8) * 255, np.ones((grow_k, grow_k), np.uint8)) > 0
         final = grown & (local >= grow_thresh) & support_soft & (artifact == 0)
         final |= candidate
         final = cv2.morphologyEx(final.astype(np.uint8) * 255, cv2.MORPH_CLOSE, np.ones((odd_kernel(int(round(min(h, w) * 0.006)), minimum=11),) * 2, np.uint8)) > 0
         final = binary_fill_holes(final)
-        final = select_component_by_point(final, target_center_px) > 0
+        final = select_gallyas_components(
+            final,
+            target_center_px,
+            support_mask=support_mask,
+            score_map=local,
+            max_components=gallyas_max_components,
+            secondary_area_frac_primary=gallyas_secondary_area_frac_primary,
+            secondary_area_frac_total=gallyas_secondary_area_frac_total,
+            secondary_support_overlap_min=gallyas_secondary_support_overlap_min,
+            secondary_score_frac_primary=gallyas_secondary_score_frac_primary,
+        ) > 0
         core = candidate.copy()
         return finalize_mask_metrics(final > 0, ownership_strict, resid, artifact, candidate > 0, core > 0, blur.astype(np.uint8))
 
@@ -1231,6 +1537,12 @@ def write_candidate_csv(path: Path, rows: Sequence[dict]) -> None:
         "level0_y",
         "level0_w",
         "level0_h",
+        "crop_overview_x1",
+        "crop_overview_y1",
+        "crop_overview_x2",
+        "crop_overview_y2",
+        "crop_overview_w",
+        "crop_overview_h",
         "crop_level",
         "mask_method",
         "crop_path",
@@ -1406,8 +1718,8 @@ def main() -> None:
     for idx, candidate in enumerate(candidates, start=1):
         label = candidate.section.short_label if candidate.section else f"cand_{idx}"
         print(f"[crop] {idx}/{len(candidates)} {label}", flush=True)
-        pad_overview = max(24, int(round(max(candidate.w, candidate.h) * 0.08)))
-        bbox_level0 = convert_bbox_to_level0(slide, candidate, pad_overview=pad_overview)
+        crop_bbox_overview = proposal_crop_rect_overview(candidate, overview_rgb, stain)
+        bbox_level0 = convert_bbox_to_level0(slide, crop_bbox_overview)
         crop_rgb = extract_crop(slide, bbox_level0, args.crop_level)
         ownership_strict, ownership_soft, support_mask = build_crop_ownership_masks(
             target_candidate=candidate,
@@ -1503,6 +1815,12 @@ def main() -> None:
             "level0_y": bbox_level0[1],
             "level0_w": bbox_level0[2],
             "level0_h": bbox_level0[3],
+            "crop_overview_x1": crop_bbox_overview[0],
+            "crop_overview_y1": crop_bbox_overview[1],
+            "crop_overview_x2": crop_bbox_overview[2],
+            "crop_overview_y2": crop_bbox_overview[3],
+            "crop_overview_w": crop_bbox_overview[2] - crop_bbox_overview[0],
+            "crop_overview_h": crop_bbox_overview[3] - crop_bbox_overview[1],
             "crop_level": args.crop_level,
             "mask_method": args.mask_method,
             "crop_path": str(crop_path),

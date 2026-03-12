@@ -15,8 +15,12 @@ Contents:
   - create `.venv` and install Windows dependencies
 - `start_gui.bat`
   - Windows launcher
+- `run_timing_harness.bat`
+  - Windows-side timing harness launcher that uses the same Python environment selection logic as the GUI
 - `launch_gui.py`
   - explicit Python entry point used by the Windows launcher
+- `timing_harness_windows.py`
+  - benchmark script for cold start / warm start / cache-hit timing and small quality-speed checks
 - `bootstrap_qt_env.py`
   - Windows Qt bootstrap helper that adds PySide6 DLL and plugin paths before launching the GUI
 - `hitl_gui/models.py`
@@ -42,3 +46,9 @@ Windows quick start:
 2. `cd /d C:\work\registration_pipeline\histology\gui_mvp`
 3. Run `setup_windows_env.bat`
 4. Run `start_gui.bat`
+
+Windows timing harness:
+
+1. Open `cmd.exe`
+2. `cd /d C:\work\registration_pipeline\histology\gui_mvp`
+3. Run `run_timing_harness.bat --output-dir "C:\Users\Siqi\Desktop\REVIEW\windows_timing_run"`

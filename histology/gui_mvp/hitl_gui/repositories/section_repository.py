@@ -87,5 +87,28 @@ class SectionRepository:
         ).fetchone()
         return str(row["revision_id"]) if row is not None else None
 
+    def get_section_state(self, section_uid: str) -> dict:
+        row = self.conn.execute(
+            """
+            SELECT mirror_state, review_status, manual_mask_version, notes
+            FROM sections
+            WHERE section_uid = ?
+            """,
+            (section_uid,),
+        ).fetchone()
+        if row is None:
+            return {
+                "mirror_state": "original",
+                "review_status": "proposed",
+                "manual_mask_version": 0,
+                "notes": "",
+            }
+        return {
+            "mirror_state": str(row["mirror_state"]),
+            "review_status": str(row["review_status"]),
+            "manual_mask_version": int(row["manual_mask_version"]),
+            "notes": str(row["notes"]),
+        }
+
     def delete_section(self, section_uid: str) -> None:
         self.conn.execute("DELETE FROM sections WHERE section_uid = ?", (section_uid,))

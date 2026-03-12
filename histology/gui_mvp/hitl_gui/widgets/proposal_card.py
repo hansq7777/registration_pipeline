@@ -16,9 +16,10 @@ class ProposalCard(QWidget):
         self.label = label
         self.proposal_index = proposal_index
         self.on_run_mask = on_run_mask
+        self.preview_loaded = False
         self.title = QLabel(label)
         self.title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label = QLabel("No preview")
+        self.image_label = QLabel("Preview on demand")
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.image_label.setMinimumHeight(120)
         self.run_button = QPushButton("Run Mask")
@@ -32,9 +33,16 @@ class ProposalCard(QWidget):
 
     def set_preview(self, rgb: Optional[np.ndarray]) -> None:
         if rgb is None:
-            self.image_label.setText("No preview")
+            self.preview_loaded = False
+            self.image_label.setText("Preview on demand")
             self.image_label.setPixmap(QPixmap())
             return
+        self.preview_loaded = True
         qimg = qimage_from_rgb_array(rgb)
         pix = QPixmap.fromImage(qimg).scaledToWidth(240, Qt.TransformationMode.SmoothTransformation)
         self.image_label.setPixmap(pix)
+
+    def clear_preview(self) -> None:
+        self.preview_loaded = False
+        self.image_label.setText("Preview on demand")
+        self.image_label.setPixmap(QPixmap())

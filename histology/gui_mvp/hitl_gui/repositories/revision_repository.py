@@ -20,6 +20,13 @@ class RevisionRepository:
         ).fetchone()
         return str(row["revision_id"]) if row is not None else None
 
+    def count_revisions(self, section_uid: str) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM revisions WHERE section_uid = ?",
+            (section_uid,),
+        ).fetchone()
+        return int(row["n"]) if row is not None else 0
+
     def create_mask_revision(
         self,
         *,

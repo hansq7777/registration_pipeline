@@ -23,6 +23,9 @@ class ProposalBox:
     artifact_mask_auto: Optional[np.ndarray] = None
     tissue_mask_final: Optional[np.ndarray] = None
     artifact_mask_final: Optional[np.ndarray] = None
+    mask_work_level: Optional[int] = None
+    mask_work_shape: Optional[tuple[int, int]] = None
+    mask_preset: str = "latest_contextual"
     mirror_enabled: bool = False
     latest_revision_id: Optional[str] = None
     notes: str = ""
@@ -46,6 +49,9 @@ class LoadedSlide:
     level_dimensions: tuple[tuple[int, int], ...]
     level_downsamples: tuple[float, ...]
     backend: str = "openslide"
+    mpp_x: Optional[float] = None
+    mpp_y: Optional[float] = None
+    objective_power: Optional[float] = None
     temp_proxy_dir: Optional[Path] = None
     fallback_reason: str = ""
     tifffile_midres_page_index: Optional[int] = None
@@ -65,3 +71,9 @@ class ExportPlanItem:
     section_uid: str
     revision_id: Optional[str]
     section_dir: Path
+    expected_label: Optional[str] = None
+    manual_mask_version: int = 0
+    revision_count: int = 0
+    review_notes: str = ""
+    review_status: str = "proposed"
+    mirror_state: str = "original"

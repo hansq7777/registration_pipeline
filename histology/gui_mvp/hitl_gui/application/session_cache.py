@@ -67,6 +67,14 @@ class SlideSessionCache:
             )
         return self.section_raw_crop_cache[key].copy()
 
+    def store_section_crop(self, proposal: ProposalBox, crop_level: int, crop_rgb: np.ndarray) -> None:
+        key = self._crop_key(proposal, crop_level, "section")
+        self.section_raw_crop_cache[key] = crop_rgb.copy()
+
+    def has_section_crop(self, proposal: ProposalBox, crop_level: int) -> bool:
+        key = self._crop_key(proposal, crop_level, "section")
+        return key in self.section_raw_crop_cache
+
     def invalidate_proposal(self, proposal: ProposalBox) -> None:
         prefixes = {
             ("preview", proposal.label),

@@ -39,6 +39,7 @@ class MaskEditorLabel(QWidget):
 
         self.hover_pos_display: Optional[tuple[int, int]] = None
         self.on_mask_changed: Optional[Callable[[], None]] = None
+        self.on_painting_state_changed: Optional[Callable[[bool], None]] = None
 
         self._painting = False
         self._last_draw_coord_display: Optional[tuple[int, int]] = None
@@ -93,6 +94,9 @@ class MaskEditorLabel(QWidget):
 
     def set_on_mask_changed(self, callback: Callable[[], None]) -> None:
         self.on_mask_changed = callback
+
+    def set_on_painting_state_changed(self, callback: Callable[[bool], None]) -> None:
+        self.on_painting_state_changed = callback
 
     def _rebuild_display_buffers(self) -> None:
         if self.raw_rgb_full is None or self.tissue_mask_full is None or self.artifact_mask_full is None:
@@ -305,6 +309,8 @@ class MaskEditorLabel(QWidget):
         self._last_draw_coord_display = None
         self._stroke_points_display = []
         self._stroke_dirty_display_rect = None
+        if self.on_painting_state_changed is not None:
+            self.on_painting_state_changed(True)
         if self.stroke_mask_display is not None:
             self.stroke_mask_display.fill(0)
         if self.stroke_rgba_display is not None:
@@ -457,6 +463,8 @@ class MaskEditorLabel(QWidget):
             self._commit_stroke()
         if was_painting and self.on_mask_changed is not None:
             self.on_mask_changed()
+        if was_painting and self.on_painting_state_changed is not None:
+            self.on_painting_state_changed(False)
         super().mouseReleaseEvent(event)
 
     def wheelEvent(self, event: QWheelEvent) -> None:
@@ -490,6 +498,31 @@ class MaskEditorLabel(QWidget):
         mask = cv2.morphologyEx(mask * 255, cv2.MORPH_CLOSE, kernel) > 0
         mask = binary_fill_holes(mask > 0)
         self.tissue_mask_full = (mask.astype(np.uint8) * 255)
+        self._rebuild_display_buffers()
+        self.refresh()
+        if self.on_mask_changed is not None:
+            self.on_mask_changed()
+
+    def morph_active_layer(self, operation: str) -> None:
+        if self.tissue_mask_full is None or self.artifact_mask_full is None:
+            return
+        target_full = self.tissue_mask_full if self.active_layer == "tissue" else self.artifact_mask_full
+        mask = (target_full > 0).astype(np.uint8)
+        if not mask.any():
+            return
+        min_dim = min(mask.shape[:2])
+        kernel_size = max(3, int(round(min_dim * 0.002)))
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        kernel = np.ones((kernel_size, kernel_size), np.uint8)
+        if operation == "shrink":
+            updated = cv2.erode(mask * 255, kernel, iterations=1) > 0
+        elif operation == "expand":
+            updated = cv2.dilate(mask * 255, kernel, iterations=1) > 0
+        else:
+            raise ValueError(f"Unknown morph operation: {operation}")
+
+        target_full[:, :] = updated.astype(np.uint8) * 255
         self._rebuild_display_buffers()
         self.refresh()
         if self.on_mask_changed is not None:

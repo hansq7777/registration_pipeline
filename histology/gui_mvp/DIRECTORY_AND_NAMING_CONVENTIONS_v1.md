@@ -99,10 +99,14 @@ Rules:
 
 ```text
 cleaned/foreground_rgba_v001.png
-cleaned/foreground_rgb_white_v001.png
-cleaned/foreground_rgb_black_v001.png
 cleaned/cleaned_revision_manifest.json
 ```
+
+Rules:
+
+- `foreground_rgba` is the default cleaned-image export
+- white-background and black-background RGB variants are derivable later from `crop_raw + usable_tissue_mask`
+- do not export white/black RGB variants by default unless a specific experiment needs them
 
 ## 8. Export files
 
@@ -119,8 +123,43 @@ image.png
 tissue_mask.png
 artifact_mask.png
 usable_tissue_mask.png
+foreground_rgba.png
 metadata.json
 ```
+
+`metadata.json` should include at minimum:
+
+- `source_slide_identity`
+  - `identity_method`
+  - `path`
+  - `source_slide_checksum` or `size_bytes` + `mtime`
+- `source_slide`
+  - source backend and fallback reason
+  - overview/level0 geometry
+  - crop level/downsample
+  - optional physical calibration (`mpp_x`, `mpp_y`, `objective_power`)
+- `algorithm_context`
+  - export/profile version
+  - bbox algorithm version
+  - mask algorithm version
+  - `git_commit`
+- `proposal_context`
+  - `expected_label`
+  - `candidate_rank`
+  - `row_index`
+  - `all_candidate_boxes_snapshot`
+- `crop_bbox_overview`
+- `crop_bbox_level0`
+- `canvas_to_slide_level0`
+- `mask_qc_stats`
+  - area
+  - connected components
+  - border touch ratio
+  - neighbor occupancy ratio
+- `manual_edit_summary`
+- `physical_orientation`
+- `reader_confidence`
+- `output_files`
 
 ## 9. Revision files
 

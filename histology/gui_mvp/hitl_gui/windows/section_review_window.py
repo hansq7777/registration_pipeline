@@ -28,8 +28,6 @@ class SectionReviewWindow(QWidget):
                 "artifact_mask_final",
                 "usable_tissue_mask",
                 "foreground_rgba",
-                "foreground_rgb_white",
-                "foreground_rgb_black",
             ]
         )
         self.tool_select = QComboBox()
