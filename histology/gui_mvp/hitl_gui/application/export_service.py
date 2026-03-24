@@ -103,13 +103,9 @@ def _proposal_context(plan: ExportPlanItem, all_proposals) -> dict:
 
 def _mask_qc_stats(
     tissue_mask: np.ndarray,
-    artifact_mask: np.ndarray,
-    usable_mask: np.ndarray,
     ownership_strict: np.ndarray | None = None,
 ) -> dict:
     tissue = tissue_mask > 0
-    artifact = artifact_mask > 0
-    usable = usable_mask > 0
     h, w = tissue.shape[:2]
     mask_area = int(tissue.sum())
     num, labels, stats, _ = cv2.connectedComponentsWithStats(tissue.astype(np.uint8), 8)
@@ -128,8 +124,6 @@ def _mask_qc_stats(
 
     return {
         "tissue_area_px": mask_area,
-        "artifact_area_px": int(artifact.sum()),
-        "usable_area_px": int(usable.sum()),
         "tissue_connected_components": max(0, int(num - 1)),
         "tissue_component_areas_desc_px": component_areas,
         "largest_tissue_component_px": int(component_areas[0]) if component_areas else 0,
@@ -150,6 +144,7 @@ class ExportWorker(QObject):
         export_root: Path,
         crop_level: int,
         profile_name: str = "review_mask",
+        include_masks: bool = True,
     ) -> None:
         super().__init__()
         self.loaded_slide = loaded_slide
@@ -157,6 +152,7 @@ class ExportWorker(QObject):
         self.export_root = export_root
         self.crop_level = crop_level
         self.profile_name = profile_name
+        self.include_masks = bool(include_masks)
         self.max_workers = max(1, min(4, (os.cpu_count() or 1)))
         self._cancel_event = threading.Event()
 
@@ -172,9 +168,7 @@ class ExportWorker(QObject):
         self,
         plan: ExportPlanItem,
         crop_rgb: np.ndarray,
-        tissue_mask: np.ndarray,
-        artifact_mask: np.ndarray,
-        usable_mask: np.ndarray,
+        tissue_mask: np.ndarray | None,
         export_hash: str,
     ) -> dict:
         proposal = plan.proposal
@@ -208,6 +202,8 @@ class ExportWorker(QObject):
             ownership_strict = None
         if plan.proposal.mask_preset == "legacy_simple":
             mask_algorithm_version = "gui_legacy_simple_autoseg_v1"
+        elif plan.proposal.mask_preset == "m3_hyst_entres_guard_v1":
+            mask_algorithm_version = "gui_m3_hyst_entres_guard_autoseg_v1"
         elif plan.proposal.mask_preset == "hybrid_balanced":
             mask_algorithm_version = "gui_hybrid_balanced_autoseg_v2"
         elif self.loaded_slide.stain.lower() == "nissl":
@@ -217,7 +213,7 @@ class ExportWorker(QObject):
         else:
             mask_algorithm_version = "gui_simple_autoseg_v1"
         bbox_algorithm_version = (
-            "gallyas_bbox_hybrid_topfloor55_wide24_v4"
+            "gallyas_bbox_dr_localadaptive_compete_v2_sidepad"
             if self.loaded_slide.stain.lower() == "gallyas"
             else "coverage_first_bbox_v1"
         )
@@ -265,12 +261,12 @@ class ExportWorker(QObject):
             "algorithm_context": {
                 "algorithm_version": "histology_gui_export_v3",
                 "bbox_algorithm_version": bbox_algorithm_version,
-                "mask_algorithm_version": mask_algorithm_version,
-                "mask_preset_selected": plan.proposal.mask_preset,
+                "mask_algorithm_version": mask_algorithm_version if self.include_masks else None,
+                "mask_preset_selected": plan.proposal.mask_preset if self.include_masks else None,
                 "crop_policy_name": bbox_algorithm_version,
                 "proposal_source": "gui_overview_proposal",
-                "mask_source_layer": "tissue_mask_final/artifact_mask_final",
-                "mask_policy_name": mask_algorithm_version,
+                "mask_source_layer": "tissue_mask_final" if self.include_masks else None,
+                "mask_policy_name": mask_algorithm_version if self.include_masks else None,
                 **_git_context(),
             },
             "proposal_context": _proposal_context(plan, self.loaded_slide.proposals),
@@ -317,9 +313,13 @@ class ExportWorker(QObject):
                     "slide_y = origin_y + canvas_y * scale_y."
                 ),
             },
-            "mask_qc_stats": _mask_qc_stats(tissue_mask, artifact_mask, usable_mask, ownership_strict),
+            "mask_qc_stats": (
+                _mask_qc_stats(tissue_mask, ownership_strict)
+                if self.include_masks and tissue_mask is not None
+                else None
+            ),
             "manual_edit_summary": {
-                "manually_edited": bool(plan.revision_count > 0 or plan.manual_mask_version > 0),
+                "manually_edited": bool(self.include_masks and (plan.revision_count > 0 or plan.manual_mask_version > 0)),
                 "revision_count": int(plan.revision_count),
                 "manual_mask_version": int(plan.manual_mask_version),
                 "latest_revision_id": plan.revision_id,
@@ -355,19 +355,25 @@ class ExportWorker(QObject):
                 "fallback_reason": self.loaded_slide.fallback_reason or None,
             },
             "derived_outputs": {
-                "usable_tissue_mask": "tissue_mask_final minus artifact_mask_final",
-                "foreground_rgba": "crop_raw RGB with alpha from usable_tissue_mask",
-                "foreground_rgb_white": "derivable later from crop_raw + usable_tissue_mask",
-                "foreground_rgb_black": "derivable later from crop_raw + usable_tissue_mask",
+                "mask_labels": "single-channel label image: 0 background, 1 tissue, 2 artifact" if self.include_masks else None,
+                "mask_preview": "RGB preview for folder thumbnails: tissue red, artifact cyan" if self.include_masks else None,
+                "foreground_rgba": "crop_raw RGB with alpha from final tissue extraction mask" if self.include_masks else None,
             },
-            "output_files": [
+            "output_files": ["crop_raw.png", "metadata.json"]
+            if not self.include_masks
+            else [
                 "crop_raw.png",
-                "tissue_mask_final.png",
-                "artifact_mask_final.png",
-                "usable_tissue_mask.png",
+                "mask_labels.png",
+                "mask_preview.png",
                 "foreground_rgba.png",
                 "metadata.json",
             ],
+            "pipeline_stage": "crop_exported" if not self.include_masks else "mask_exported",
+            "workspace_status": {
+                "crop_exported": True,
+                "mask_predicted": bool(self.include_masks),
+                "mask_reviewed": bool(self.include_masks and plan.review_status == "mask_reviewed"),
+            },
         }
         if self.loaded_slide.mpp_x is not None and self.loaded_slide.mpp_y is not None:
             metadata["crop_bbox_level0_um_relative_to_slide_origin"] = {
@@ -409,13 +415,13 @@ class ExportWorker(QObject):
                         continue
 
                     crop_rgb = item["crop_rgb"]
-                    payload = item["payload"]
                     metadata = item["metadata"]
                     write_png_lossless_fast(sec_dir / "crop_raw.png", crop_rgb, "RGB")
-                    write_png_lossless_fast(sec_dir / "tissue_mask_final.png", payload["tissue_mask_final"], "L")
-                    write_png_lossless_fast(sec_dir / "artifact_mask_final.png", payload["artifact_mask_final"], "L")
-                    write_png_lossless_fast(sec_dir / "usable_tissue_mask.png", payload["usable_tissue_mask"], "L")
-                    write_png_lossless_fast(sec_dir / "foreground_rgba.png", payload["foreground_rgba"], "RGBA")
+                    payload = item.get("payload")
+                    if self.include_masks and payload is not None:
+                        write_png_lossless_fast(sec_dir / "mask_labels.png", payload["mask_labels"], "L")
+                        write_png_lossless_fast(sec_dir / "mask_preview.png", payload["mask_preview"], "RGB")
+                        write_png_lossless_fast(sec_dir / "foreground_rgba.png", payload["foreground_rgba"], "RGBA")
                     (sec_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
                     with manifest_lock:
                         manifest_entries.append(metadata)
@@ -446,20 +452,27 @@ class ExportWorker(QObject):
                     crop_level=self.crop_level,
                     slide_handle=slide_handle,
                 )
-                tissue = plan.proposal.tissue_mask_final
-                artifact = plan.proposal.artifact_mask_final
-                if tissue is None:
-                    tissue = np.zeros(crop_rgb.shape[:2], dtype=np.uint8)
-                if artifact is None:
-                    artifact = np.zeros(crop_rgb.shape[:2], dtype=np.uint8)
-                tissue = self._resize_mask_to_shape(tissue, crop_rgb.shape[:2])
-                artifact = self._resize_mask_to_shape(artifact, crop_rgb.shape[:2])
+                tissue = None
+                artifact = None
+                payload = None
+                if self.include_masks:
+                    tissue = plan.proposal.tissue_mask_final
+                    artifact = plan.proposal.artifact_mask_final
+                    if tissue is None:
+                        tissue = np.zeros(crop_rgb.shape[:2], dtype=np.uint8)
+                    if artifact is None:
+                        artifact = np.zeros(crop_rgb.shape[:2], dtype=np.uint8)
+                    tissue = self._resize_mask_to_shape(tissue, crop_rgb.shape[:2])
+                    artifact = self._resize_mask_to_shape(artifact, crop_rgb.shape[:2])
                 if plan.proposal.mirror_enabled:
                     crop_rgb = crop_rgb[:, ::-1, :]
-                    tissue = tissue[:, ::-1]
-                    artifact = artifact[:, ::-1]
+                    if tissue is not None:
+                        tissue = tissue[:, ::-1]
+                    if artifact is not None:
+                        artifact = artifact[:, ::-1]
 
-                payload = build_export_payload(crop_rgb, tissue, artifact)
+                if self.include_masks and tissue is not None and artifact is not None:
+                    payload = build_export_payload(crop_rgb, tissue, artifact)
                 export_hash = hashlib.sha1(
                     json.dumps(
                         {
@@ -476,9 +489,7 @@ class ExportWorker(QObject):
                 metadata = self._build_metadata(
                     plan,
                     crop_rgb,
-                    payload["tissue_mask_final"],
-                    payload["artifact_mask_final"],
-                    payload["usable_tissue_mask"],
+                    payload["tissue_mask_final"] if payload is not None else None,
                     export_hash,
                 )
                 work_queue.put(
@@ -486,8 +497,8 @@ class ExportWorker(QObject):
                         "label": plan.proposal.label,
                         "section_dir": plan.section_dir,
                         "crop_rgb": crop_rgb,
-                        "payload": payload,
                         "metadata": metadata,
+                        **({"payload": payload} if payload is not None else {}),
                     }
                 )
 

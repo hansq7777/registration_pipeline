@@ -353,9 +353,23 @@ class WorkflowService:
             )
         return plan_items, skipped
 
-    def create_export_worker(self, export_root: Path, crop_level: int, profile_name: str = "review_mask") -> ExportWorker:
+    def create_export_worker(
+        self,
+        export_root: Path,
+        crop_level: int,
+        profile_name: str = "review_mask",
+        *,
+        include_masks: bool = True,
+    ) -> ExportWorker:
         plan_items, _ = self.plan_export(export_root)
-        return ExportWorker(self.require_slide(), plan_items, export_root, crop_level, profile_name=profile_name)
+        return ExportWorker(
+            self.require_slide(),
+            plan_items,
+            export_root,
+            crop_level,
+            profile_name=profile_name,
+            include_masks=include_masks,
+        )
 
     def require_slide(self) -> LoadedSlide:
         if self.session_cache.current_slide is None:

@@ -42,6 +42,8 @@ class AutoMaskResultCache:
         stain_key = stain.lower()
         if method == "legacy_simple":
             return "gui_legacy_simple_autoseg_v1"
+        if method == "m3_hyst_entres_guard_v1":
+            return "gui_m3_hyst_entres_guard_autoseg_v1"
         if method == "hybrid_balanced":
             return "gui_hybrid_balanced_autoseg_v2"
         if stain_key == "nissl":
@@ -51,7 +53,7 @@ class AutoMaskResultCache:
         return "gui_simple_autoseg_v1"
 
     def _bbox_algorithm_version(self, stain: str) -> str:
-        return "gallyas_bbox_hybrid_topfloor55_wide24_v4" if stain.lower() == "gallyas" else "coverage_first_bbox_v1"
+        return "gallyas_bbox_dr_localadaptive_compete_v2_sidepad" if stain.lower() == "gallyas" else "coverage_first_bbox_v1"
 
     def _key_payload(
         self,

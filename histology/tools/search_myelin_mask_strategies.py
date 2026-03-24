@@ -13,6 +13,9 @@ import cv2
 import numpy as np
 from PIL import Image
 from scipy.ndimage import binary_fill_holes, binary_propagation
+from skimage.filters import threshold_otsu
+from skimage.filters.rank import entropy as rank_entropy
+from skimage.morphology import disk
 
 Image.MAX_IMAGE_PIXELS = None
 
@@ -21,6 +24,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from histology.gui_mvp.hitl_gui.pipeline_adapters.segmentation_adapter import (  # noqa: E402
+    MASK_PRESET_HYBRID_BALANCED,
     MASK_PRESET_LATEST_CONTEXTUAL,
     MASK_PRESET_LEGACY_SIMPLE,
     compute_auto_masks,
@@ -313,6 +317,814 @@ def fallback_if_too_small(mask: np.ndarray, fallback: np.ndarray, *, min_frac_of
     return mask
 
 
+def component_set_select(
+    candidate_mask: np.ndarray,
+    *,
+    score_core: np.ndarray,
+    support_mask: np.ndarray | None = None,
+    max_components: int = 2,
+    min_area_frac: float = 0.06,
+    bridge_erode_k: int = 3,
+    core_dilate_k: int = 15,
+    border_band_frac: float = 0.03,
+    border_penalty: float = 0.75,
+    min_score: float = 0.08,
+    final_close_k: int = 7,
+) -> np.ndarray:
+    candidate_mask = candidate_mask.astype(bool)
+    score_core = score_core.astype(bool)
+    support_mask = candidate_mask if support_mask is None else support_mask.astype(bool)
+    if not candidate_mask.any():
+        return candidate_mask
+
+    h, w = candidate_mask.shape[:2]
+    orig_area = max(1, int(candidate_mask.sum()))
+    border_band = max(3, int(round(min(h, w) * border_band_frac)))
+    border = np.zeros_like(candidate_mask, dtype=bool)
+    border[:border_band, :] = True
+    border[-border_band:, :] = True
+    border[:, :border_band] = True
+    border[:, -border_band:] = True
+
+    core_dil = cv2.dilate(
+        score_core.astype(np.uint8) * 255,
+        np.ones((core_dilate_k, core_dilate_k), np.uint8),
+        iterations=1,
+    ) > 0
+
+    if bridge_erode_k > 1:
+        bridge_cut = cv2.erode(
+            candidate_mask.astype(np.uint8) * 255,
+            np.ones((bridge_erode_k, bridge_erode_k), np.uint8),
+            iterations=1,
+        ) > 0
+    else:
+        bridge_cut = candidate_mask.copy()
+    if not bridge_cut.any():
+        bridge_cut = candidate_mask.copy()
+
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(bridge_cut.astype(np.uint8), 8)
+    components: list[tuple[float, np.ndarray]] = []
+    core_cent = mask_centroid_xy(score_core)
+    support_cent = mask_centroid_xy(support_mask)
+    diag = float(math.hypot(h, w)) or 1.0
+
+    for idx in range(1, num):
+        seed = labels == idx
+        comp = binary_propagation(seed, mask=candidate_mask)
+        area = int(comp.sum())
+        if area <= 0:
+            continue
+        area_frac = area / orig_area
+        overlap_core = int((comp & core_dil).sum()) / area
+        overlap_support = int((comp & support_mask).sum()) / area
+        touch_border = int((comp & border).sum()) / area
+        x1, y1, x2, y2 = tight_bbox(comp)
+        bbox_area = max(1, (x2 - x1) * (y2 - y1))
+        compactness = area / bbox_area
+        cxcy = mask_centroid_xy(comp)
+        if cxcy is None:
+            dist_core = 1.0
+            dist_support = 1.0
+        else:
+            dist_core = (
+                math.hypot(cxcy[0] - core_cent[0], cxcy[1] - core_cent[1]) / diag
+                if core_cent is not None
+                else 1.0
+            )
+            dist_support = (
+                math.hypot(cxcy[0] - support_cent[0], cxcy[1] - support_cent[1]) / diag
+                if support_cent is not None
+                else 1.0
+            )
+        score = (
+            1.20 * overlap_core
+            + 0.90 * overlap_support
+            + 0.55 * area_frac
+            + 0.25 * compactness
+            - 0.80 * dist_core
+            - 0.35 * dist_support
+            - border_penalty * touch_border
+        )
+        if area_frac >= min_area_frac or overlap_core > 0.02 or score >= min_score:
+            components.append((score, comp))
+
+    if not components:
+        return candidate_mask
+
+    components.sort(key=lambda x: x[0], reverse=True)
+    keep = np.zeros_like(candidate_mask, dtype=bool)
+    taken = 0
+    for score, comp in components:
+        if taken == 0 or (taken < max_components and score >= min_score):
+            keep |= comp
+            taken += 1
+        if taken >= max_components:
+            break
+    if not keep.any():
+        keep = components[0][1]
+
+    if final_close_k > 1:
+        keep = cv2.morphologyEx(
+            keep.astype(np.uint8) * 255,
+            cv2.MORPH_CLOSE,
+            np.ones((final_close_k, final_close_k), np.uint8),
+        ) > 0
+    keep = binary_fill_holes(keep)
+    return keep
+
+
+def _edge_touch_runs(mask: np.ndarray, side: str) -> list[tuple[int, int]]:
+    if side == "left":
+        vec = mask[:, 0]
+    elif side == "right":
+        vec = mask[:, -1]
+    elif side == "top":
+        vec = mask[0, :]
+    else:
+        vec = mask[-1, :]
+    vec = np.asarray(vec, dtype=bool)
+    if not vec.any():
+        return []
+    runs: list[tuple[int, int]] = []
+    start = None
+    for idx, val in enumerate(vec):
+        if val and start is None:
+            start = idx
+        elif not val and start is not None:
+            runs.append((start, idx))
+            start = None
+    if start is not None:
+        runs.append((start, len(vec)))
+    return runs
+
+
+def _edge_touch_vector(mask: np.ndarray, side: str, *, depth: int = 1) -> np.ndarray:
+    depth = max(1, int(depth))
+    if side == "left":
+        vec = np.any(mask[:, :depth], axis=1)
+    elif side == "right":
+        vec = np.any(mask[:, -depth:], axis=1)
+    elif side == "top":
+        vec = np.any(mask[:depth, :], axis=0)
+    else:
+        vec = np.any(mask[-depth:, :], axis=0)
+    return np.asarray(vec, dtype=bool)
+
+
+def _dilate_bool_1d(vec: np.ndarray, radius: int) -> np.ndarray:
+    vec = np.asarray(vec, dtype=bool)
+    if radius <= 0 or not vec.any():
+        return vec
+    kernel = np.ones(2 * radius + 1, dtype=np.uint8)
+    dil = np.convolve(vec.astype(np.uint8), kernel, mode="same")
+    return dil > 0
+
+
+def fill_edge_touch_strips(
+    mask: np.ndarray,
+    support_mask: np.ndarray,
+    *,
+    strip_frac: float = 0.06,
+    min_runs: int = 2,
+    min_span_frac: float = 0.12,
+    close_k: int = 5,
+) -> np.ndarray:
+    mask = mask.astype(bool)
+    support_mask = support_mask.astype(bool)
+    if not mask.any() or not support_mask.any():
+        return mask
+
+    h, w = mask.shape[:2]
+    out = mask.copy()
+    strip_w = max(4, int(round(w * strip_frac)))
+    min_span = max(8, int(round(h * min_span_frac)))
+
+    for side in ("left", "right"):
+        runs = _edge_touch_runs(out, side)
+        if len(runs) < min_runs:
+            continue
+        span_lo = min(r[0] for r in runs)
+        span_hi = max(r[1] for r in runs)
+        if (span_hi - span_lo) < min_span:
+            continue
+
+        if side == "left":
+            sup = support_mask[:, :strip_w]
+            seed = np.zeros_like(sup, dtype=bool)
+            seed[:, 0] = sup[:, 0]
+            edge_conn = binary_propagation(seed, mask=sup)
+            fill = np.zeros_like(out, dtype=bool)
+            fill[span_lo:span_hi, :strip_w] = edge_conn[span_lo:span_hi, :]
+        else:
+            sup = support_mask[:, w - strip_w :]
+            seed = np.zeros_like(sup, dtype=bool)
+            seed[:, -1] = sup[:, -1]
+            edge_conn = binary_propagation(seed, mask=sup)
+            fill = np.zeros_like(out, dtype=bool)
+            fill[span_lo:span_hi, w - strip_w :] = edge_conn[span_lo:span_hi, :]
+
+        out |= fill
+
+    if close_k > 1:
+        out = cv2.morphologyEx(
+            out.astype(np.uint8) * 255,
+            cv2.MORPH_CLOSE,
+            np.ones((close_k, close_k), np.uint8),
+        ) > 0
+    out = binary_fill_holes(out)
+    return out
+
+
+def edge_support_augment(
+    mask: np.ndarray,
+    support_mask: np.ndarray,
+    score_map: np.ndarray,
+    *,
+    strip_frac: float = 0.08,
+    inner_frac: float = 0.16,
+    score_q: float = 0.35,
+    min_row_frac: float = 0.05,
+    row_pad_frac: float = 0.03,
+    close_k: int = 5,
+) -> np.ndarray:
+    mask = mask.astype(bool)
+    support_mask = support_mask.astype(bool)
+    if not mask.any() or not support_mask.any():
+        return mask
+
+    h, w = mask.shape[:2]
+    strip_w = max(6, int(round(w * strip_frac)))
+    inner_w = max(strip_w + 2, int(round(w * inner_frac)))
+    min_rows = max(8, int(round(h * min_row_frac)))
+    row_pad = max(2, int(round(h * row_pad_frac)))
+
+    vals = score_map[support_mask]
+    score_th = float(np.quantile(vals, score_q)) if vals.size else 0.0
+    aug = mask.copy()
+
+    for side in ("left", "right"):
+        if side == "left":
+            strip_support = support_mask[:, :strip_w]
+            inner_mask = mask[:, :inner_w]
+            strip_score = score_map[:, :strip_w]
+            corridor = np.zeros_like(mask, dtype=bool)
+            corridor[:, :inner_w] = True
+        else:
+            strip_support = support_mask[:, -strip_w:]
+            inner_mask = mask[:, -inner_w:]
+            strip_score = score_map[:, -strip_w:]
+            corridor = np.zeros_like(mask, dtype=bool)
+            corridor[:, -inner_w:] = True
+
+        support_rows = np.any(strip_support & (strip_score >= score_th), axis=1)
+        inner_rows = np.any(inner_mask, axis=1)
+        active_rows = support_rows & _dilate_bool_1d(inner_rows, row_pad)
+        if int(active_rows.sum()) < min_rows:
+            continue
+
+        row_mask = np.zeros_like(mask, dtype=bool)
+        row_mask[active_rows, :] = True
+        corridor_support = support_mask & corridor & row_mask
+        if not corridor_support.any():
+            continue
+        aug |= corridor_support
+
+    if close_k > 1:
+        aug = cv2.morphologyEx(
+            aug.astype(np.uint8) * 255,
+            cv2.MORPH_CLOSE,
+            np.ones((close_k, close_k), np.uint8),
+        ) > 0
+    aug = binary_fill_holes(aug)
+    return aug
+
+
+def edge_run_completion(
+    mask: np.ndarray,
+    support_mask: np.ndarray,
+    score_map: np.ndarray,
+    *,
+    strip_frac: float = 0.08,
+    depth: int = 2,
+    min_runs: int = 2,
+    min_span_frac: float = 0.12,
+    row_pad_frac: float = 0.03,
+    score_q: float = 0.20,
+    close_k: int = 5,
+) -> np.ndarray:
+    mask = mask.astype(bool)
+    support_mask = support_mask.astype(bool)
+    if not mask.any() or not support_mask.any():
+        return mask
+
+    h, w = mask.shape[:2]
+    strip_w = max(6, int(round(w * strip_frac)))
+    min_span = max(8, int(round(h * min_span_frac)))
+    row_pad = max(2, int(round(h * row_pad_frac)))
+    vals = score_map[support_mask]
+    score_th = float(np.quantile(vals, score_q)) if vals.size else 0.0
+
+    out = mask.copy()
+    support_score = support_mask & (score_map >= score_th)
+
+    for side in ("left", "right"):
+        touch_vec = _edge_touch_vector(support_score, side, depth=depth)
+        runs = _edge_touch_runs(touch_vec[:, None] if touch_vec.ndim == 1 and side in ("left", "right") else touch_vec, "left") if False else None
+        # direct 1D run extraction
+        runs_1d: list[tuple[int, int]] = []
+        start = None
+        for idx, val in enumerate(touch_vec):
+            if val and start is None:
+                start = idx
+            elif (not val) and start is not None:
+                runs_1d.append((start, idx))
+                start = None
+        if start is not None:
+            runs_1d.append((start, len(touch_vec)))
+        if len(runs_1d) < min_runs:
+            continue
+        span_lo = min(r[0] for r in runs_1d)
+        span_hi = max(r[1] for r in runs_1d)
+        if (span_hi - span_lo) < min_span:
+            continue
+        span_lo = max(0, span_lo - row_pad)
+        span_hi = min(h, span_hi + row_pad)
+
+        for y in range(span_lo, span_hi):
+            if side == "left":
+                support_cols = np.where(support_score[y, :strip_w])[0]
+                mask_cols = np.where(mask[y, :strip_w])[0]
+                cols = support_cols if support_cols.size else mask_cols
+                if cols.size:
+                    x_end = int(cols.max()) + 1
+                    out[y, :x_end] = True
+            else:
+                support_cols = np.where(support_score[y, w - strip_w :])[0]
+                mask_cols = np.where(mask[y, w - strip_w :])[0]
+                cols = support_cols if support_cols.size else mask_cols
+                if cols.size:
+                    x_start = w - strip_w + int(cols.min())
+                    out[y, x_start:] = True
+
+    if close_k > 1:
+        out = cv2.morphologyEx(
+            out.astype(np.uint8) * 255,
+            cv2.MORPH_CLOSE,
+            np.ones((close_k, close_k), np.uint8),
+        ) > 0
+    out = binary_fill_holes(out)
+    return out
+
+
+def top_envelope_from_mask(
+    mask: np.ndarray,
+    *,
+    smooth_frac: float = 0.04,
+    min_valid_frac: float = 0.20,
+) -> tuple[np.ndarray | None, np.ndarray]:
+    mask = mask.astype(bool)
+    h, w = mask.shape[:2]
+    env = np.full(w, np.nan, dtype=np.float32)
+    for x in range(w):
+        ys = np.where(mask[:, x])[0]
+        if ys.size:
+            env[x] = float(ys.min())
+    valid = np.isfinite(env)
+    if int(valid.sum()) < max(8, int(round(w * min_valid_frac))):
+        return None, valid
+
+    xs = np.arange(w, dtype=np.float32)
+    env_interp = env.copy()
+    env_interp[~valid] = np.interp(xs[~valid], xs[valid], env[valid])
+
+    k = max(5, int(round(w * smooth_frac)))
+    if k % 2 == 0:
+        k += 1
+    env_smooth = cv2.GaussianBlur(env_interp.reshape(1, -1), (k, 1), 0).reshape(-1)
+
+    valid_idx = np.where(valid)[0]
+    left_idx = valid_idx[: min(12, len(valid_idx))]
+    right_idx = valid_idx[-min(12, len(valid_idx)) :]
+    if left_idx.size >= 2:
+        coef = np.polyfit(left_idx.astype(np.float32), env[left_idx], 1)
+        left_x = np.arange(0, int(valid_idx[0]), dtype=np.float32)
+        if left_x.size:
+            env_smooth[left_x.astype(int)] = np.polyval(coef, left_x)
+    if right_idx.size >= 2:
+        coef = np.polyfit(right_idx.astype(np.float32), env[right_idx], 1)
+        right_x = np.arange(int(valid_idx[-1]) + 1, w, dtype=np.float32)
+        if right_x.size:
+            env_smooth[right_x.astype(int)] = np.polyval(coef, right_x)
+
+    env_smooth = np.clip(env_smooth, 0, h - 1).astype(np.float32)
+    return env_smooth, valid
+
+
+def top_envelope_corridor(
+    envelope: np.ndarray,
+    shape: tuple[int, int],
+    *,
+    band_frac: float = 0.08,
+    lower_slack_frac: float = 0.05,
+) -> np.ndarray:
+    h, w = shape[:2]
+    band = max(6, int(round(h * band_frac)))
+    lower = max(4, int(round(h * lower_slack_frac)))
+    corr = np.zeros((h, w), dtype=bool)
+    for x in range(w):
+        y = int(round(float(envelope[x])))
+        y0 = max(0, y - band // 2)
+        y1 = min(h, y + band // 2 + lower)
+        corr[y0:y1, x] = True
+    return corr
+
+
+def top_envelope_lateral_completion(
+    mask: np.ndarray,
+    support_mask: np.ndarray,
+    score_map: np.ndarray,
+    nonwhite: np.ndarray,
+    *,
+    band_frac: float = 0.08,
+    lower_slack_frac: float = 0.05,
+    score_q: float = 0.22,
+    nonwhite_min: int = 10,
+    close_k: int = 5,
+) -> np.ndarray:
+    mask = mask.astype(bool)
+    support_mask = support_mask.astype(bool)
+    if not mask.any() or not support_mask.any():
+        return mask
+
+    env, valid = top_envelope_from_mask(mask)
+    if env is None:
+        return mask
+    corridor = top_envelope_corridor(env, mask.shape, band_frac=band_frac, lower_slack_frac=lower_slack_frac)
+    vals = score_map[support_mask]
+    score_th = float(np.quantile(vals, score_q)) if vals.size else 0.0
+    weak_support = (support_mask & corridor & (score_map >= score_th)) | (corridor & (nonwhite >= nonwhite_min) & mask)
+    out = binary_propagation(mask, mask=(mask | weak_support))
+    if close_k > 1:
+        out = cv2.morphologyEx(
+            out.astype(np.uint8) * 255,
+            cv2.MORPH_CLOSE,
+            np.ones((close_k, close_k), np.uint8),
+        ) > 0
+    out = binary_fill_holes(out)
+    return out
+
+
+def top_envelope_bridge_completion(
+    mask: np.ndarray,
+    support_mask: np.ndarray,
+    score_map: np.ndarray,
+    nonwhite: np.ndarray,
+    *,
+    band_frac: float = 0.08,
+    lower_slack_frac: float = 0.05,
+    score_q: float = 0.16,
+    nonwhite_min: int = 8,
+    min_bridge_cols_frac: float = 0.08,
+    close_k: int = 7,
+) -> np.ndarray:
+    mask = mask.astype(bool)
+    support_mask = support_mask.astype(bool)
+    if not mask.any() or not support_mask.any():
+        return mask
+
+    env, valid = top_envelope_from_mask(mask)
+    if env is None:
+        return mask
+    h, w = mask.shape[:2]
+    corridor = top_envelope_corridor(env, mask.shape, band_frac=band_frac, lower_slack_frac=lower_slack_frac)
+    vals = score_map[support_mask]
+    score_th = float(np.quantile(vals, score_q)) if vals.size else 0.0
+    support_corr = support_mask & corridor & ((score_map >= score_th) | (nonwhite >= nonwhite_min))
+
+    col_has = np.any(mask & corridor, axis=0)
+    first = int(np.argmax(col_has)) if col_has.any() else 0
+    last = int(w - 1 - np.argmax(col_has[::-1])) if col_has.any() else w - 1
+    min_bridge_cols = max(8, int(round(w * min_bridge_cols_frac)))
+    if last - first >= min_bridge_cols:
+        bridge_region = np.zeros_like(mask, dtype=bool)
+        bridge_region[:, first : last + 1] = True
+        support_corr |= corridor & bridge_region & (nonwhite >= nonwhite_min)
+
+    out = binary_propagation(mask, mask=(mask | support_corr))
+    if close_k > 1:
+        out = cv2.morphologyEx(
+            out.astype(np.uint8) * 255,
+            cv2.MORPH_CLOSE,
+            np.ones((close_k, close_k), np.uint8),
+        ) > 0
+    out = binary_fill_holes(out)
+    return out
+
+
+def edge_aware_support_mask(
+    base_support: np.ndarray,
+    reference_mask: np.ndarray,
+    score_map: np.ndarray,
+    nonwhite: np.ndarray,
+    *,
+    band_frac: float = 0.08,
+    lower_slack_frac: float = 0.05,
+    lateral_strip_frac: float = 0.22,
+    inner_anchor_frac: float = 0.18,
+    score_q: float = 0.18,
+    nonwhite_min: int = 10,
+    row_pad_frac: float = 0.03,
+    close_k: int = 5,
+) -> np.ndarray:
+    base_support = base_support.astype(bool)
+    reference_mask = reference_mask.astype(bool)
+    if not base_support.any():
+        return base_support
+
+    h, w = base_support.shape[:2]
+    env, _ = top_envelope_from_mask(reference_mask)
+    if env is None:
+        return base_support
+
+    corridor = top_envelope_corridor(
+        env,
+        base_support.shape,
+        band_frac=band_frac,
+        lower_slack_frac=lower_slack_frac,
+    )
+    strip_w = max(6, int(round(w * lateral_strip_frac)))
+    inner_w = max(strip_w + 2, int(round(w * inner_anchor_frac)))
+    row_pad = max(2, int(round(h * row_pad_frac)))
+
+    vals = score_map[base_support]
+    score_th = float(np.quantile(vals, score_q)) if vals.size else 0.0
+    out = base_support.copy()
+
+    for side in ("left", "right"):
+        if side == "left":
+            outer = np.zeros_like(base_support, dtype=bool)
+            outer[:, :strip_w] = True
+            inner = np.zeros_like(base_support, dtype=bool)
+            inner[:, :inner_w] = True
+        else:
+            outer = np.zeros_like(base_support, dtype=bool)
+            outer[:, -strip_w:] = True
+            inner = np.zeros_like(base_support, dtype=bool)
+            inner[:, -inner_w:] = True
+
+        inner_anchor_rows = np.any((base_support | reference_mask) & inner, axis=1)
+        active_rows = _dilate_bool_1d(inner_anchor_rows, row_pad)
+        if not active_rows.any():
+            continue
+
+        row_mask = np.zeros_like(base_support, dtype=bool)
+        row_mask[active_rows, :] = True
+        aug = outer & corridor & row_mask & (nonwhite >= nonwhite_min) & (score_map >= score_th)
+        out |= aug
+
+    if close_k > 1:
+        out = cv2.morphologyEx(
+            out.astype(np.uint8) * 255,
+            cv2.MORPH_CLOSE,
+            np.ones((close_k, close_k), np.uint8),
+        ) > 0
+    out = binary_fill_holes(out)
+    return out
+
+
+def edge_aware_support_bridge_mask(
+    base_support: np.ndarray,
+    reference_mask: np.ndarray,
+    score_map: np.ndarray,
+    nonwhite: np.ndarray,
+    *,
+    band_frac: float = 0.08,
+    lower_slack_frac: float = 0.05,
+    lateral_strip_frac: float = 0.22,
+    inner_anchor_frac: float = 0.18,
+    score_q: float = 0.14,
+    nonwhite_min: int = 8,
+    row_pad_frac: float = 0.03,
+    min_bridge_span_frac: float = 0.10,
+    close_k: int = 7,
+) -> np.ndarray:
+    base_support = base_support.astype(bool)
+    reference_mask = reference_mask.astype(bool)
+    if not base_support.any():
+        return base_support
+
+    h, w = base_support.shape[:2]
+    env, _ = top_envelope_from_mask(reference_mask)
+    if env is None:
+        return base_support
+
+    corridor = top_envelope_corridor(
+        env,
+        base_support.shape,
+        band_frac=band_frac,
+        lower_slack_frac=lower_slack_frac,
+    )
+    strip_w = max(6, int(round(w * lateral_strip_frac)))
+    inner_w = max(strip_w + 2, int(round(w * inner_anchor_frac)))
+    row_pad = max(2, int(round(h * row_pad_frac)))
+    min_span = max(8, int(round(h * min_bridge_span_frac)))
+
+    vals = score_map[base_support]
+    score_th = float(np.quantile(vals, score_q)) if vals.size else 0.0
+    support_score = (score_map >= score_th) & (nonwhite >= nonwhite_min)
+    out = base_support.copy()
+
+    for side in ("left", "right"):
+        if side == "left":
+            outer = np.zeros_like(base_support, dtype=bool)
+            outer[:, :strip_w] = True
+            inner = np.zeros_like(base_support, dtype=bool)
+            inner[:, :inner_w] = True
+        else:
+            outer = np.zeros_like(base_support, dtype=bool)
+            outer[:, -strip_w:] = True
+            inner = np.zeros_like(base_support, dtype=bool)
+            inner[:, -inner_w:] = True
+
+        inner_anchor_rows = np.any((base_support | reference_mask) & inner, axis=1)
+        active_rows = _dilate_bool_1d(inner_anchor_rows, row_pad)
+        runs = []
+        start = None
+        for i, val in enumerate(active_rows):
+            if val and start is None:
+                start = i
+            elif (not val) and start is not None:
+                runs.append((start, i))
+                start = None
+        if start is not None:
+            runs.append((start, len(active_rows)))
+
+        for y0, y1 in runs:
+            if (y1 - y0) < min_span:
+                continue
+            band = corridor[y0:y1, :] & outer[y0:y1, :]
+            cand = support_score[y0:y1, :] & band
+            if not cand.any():
+                continue
+            if side == "left":
+                cols = np.where(np.any(cand, axis=0))[0]
+                if cols.size:
+                    x_end = int(cols.max()) + 1
+                    out[y0:y1, :x_end] |= band[:, :x_end]
+            else:
+                cols = np.where(np.any(cand, axis=0))[0]
+                if cols.size:
+                    x_start = int(cols.min())
+                    out[y0:y1, x_start:] |= band[:, x_start:]
+
+    if close_k > 1:
+        out = cv2.morphologyEx(
+            out.astype(np.uint8) * 255,
+            cv2.MORPH_CLOSE,
+            np.ones((close_k, close_k), np.uint8),
+        ) > 0
+    out = binary_fill_holes(out)
+    return out
+
+
+def residual_score(crop_rgb: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
+    sigma = max(12, int(round(min(crop_rgb.shape[:2]) * 0.05)))
+    bg = cv2.GaussianBlur(gray, (0, 0), sigmaX=float(sigma), sigmaY=float(sigma))
+    return np.clip(bg.astype(np.int16) - gray.astype(np.int16), 0, 255).astype(np.uint8)
+
+
+def entropy_score(crop_rgb: np.ndarray, radius: int = 5) -> np.ndarray:
+    gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
+    ent = rank_entropy(gray, disk(max(1, int(radius))))
+    ent = cv2.GaussianBlur(ent.astype(np.float32), (0, 0), sigmaX=1.0, sigmaY=1.0)
+    if float(ent.max()) <= 1e-6:
+        return np.zeros_like(gray, dtype=np.uint8)
+    return cv2.normalize(ent, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+
+def entropy_residual_candidate(
+    crop_rgb: np.ndarray,
+    *,
+    ent_radius: int,
+    ent_q: float,
+    residual_scale: float,
+    nonwhite_min: int,
+    close_k: int,
+    open_k: int,
+) -> np.ndarray:
+    resid = residual_score(crop_rgb)
+    ent = entropy_score(crop_rgb, radius=ent_radius)
+    nonwhite = (255 - crop_rgb.min(axis=2)).astype(np.uint8)
+
+    resid_th = max(6, int(round(threshold_otsu(resid) * residual_scale)))
+    resid_mask = resid >= resid_th
+
+    ent_vals = ent[nonwhite > nonwhite_min]
+    if ent_vals.size == 0:
+        ent_mask = np.zeros_like(resid_mask, dtype=bool)
+    else:
+        ent_th = max(8, int(round(float(np.quantile(ent_vals, ent_q)))))
+        ent_mask = ent >= ent_th
+        ent_mask &= nonwhite >= nonwhite_min
+
+    mask = resid_mask | ent_mask
+    mask = cv2.morphologyEx(mask.astype(np.uint8) * 255, cv2.MORPH_CLOSE, np.ones((close_k, close_k), np.uint8)) > 0
+    mask = cv2.morphologyEx(mask.astype(np.uint8) * 255, cv2.MORPH_OPEN, np.ones((open_k, open_k), np.uint8)) > 0
+    mask = binary_fill_holes(mask)
+    return mask
+
+
+def hysteresis_support_reconstruct(
+    support_mask: np.ndarray,
+    core_score: np.ndarray,
+    structural_core: np.ndarray,
+    *,
+    core_quantile: float,
+    core_scale: float,
+    overlap_frac: float,
+    core_open_k: int,
+    final_close_k: int,
+) -> np.ndarray:
+    support_mask = support_mask.astype(bool)
+    structural_core = structural_core.astype(bool)
+    if not support_mask.any():
+        return support_mask
+
+    vals = core_score[support_mask]
+    if vals.size == 0:
+        return support_mask
+    core_th = max(6, int(round(float(np.quantile(vals, core_quantile)) * core_scale)))
+    strong_core = (core_score >= core_th) & support_mask
+    if core_open_k > 1:
+        strong_core = cv2.morphologyEx(
+            strong_core.astype(np.uint8) * 255,
+            cv2.MORPH_OPEN,
+            np.ones((core_open_k, core_open_k), np.uint8),
+        ) > 0
+    if strong_core.any():
+        struct_dil = cv2.dilate(structural_core.astype(np.uint8) * 255, np.ones((9, 9), np.uint8), iterations=1) > 0
+        seed = retain_core_overlapping_components(strong_core, struct_dil, overlap_frac=overlap_frac)
+    else:
+        seed = np.zeros_like(support_mask, dtype=bool)
+    if not seed.any():
+        seed = structural_core & support_mask
+    if not seed.any():
+        seed = support_mask
+    recon = binary_propagation(seed, mask=support_mask)
+    if final_close_k > 1:
+        recon = cv2.morphologyEx(
+            recon.astype(np.uint8) * 255,
+            cv2.MORPH_CLOSE,
+            np.ones((final_close_k, final_close_k), np.uint8),
+        ) > 0
+    recon = binary_fill_holes(recon)
+    return recon
+
+
+def _odd_kernel_from_frac(shape: tuple[int, int], frac: float, minimum: int = 3) -> int:
+    k = max(minimum, int(round(min(shape[:2]) * frac)))
+    return k if (k % 2 == 1) else (k + 1)
+
+
+def opening_by_reconstruction(mask: np.ndarray, ksize: int) -> np.ndarray:
+    mask_u8 = (mask.astype(np.uint8) * 255)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+    eroded = cv2.erode(mask_u8, kernel, iterations=1)
+    recon = binary_propagation(eroded > 0, mask=mask_u8 > 0)
+    return np.asarray(recon, dtype=bool)
+
+
+def closing_by_reconstruction(mask: np.ndarray, ksize: int) -> np.ndarray:
+    inv = ~mask.astype(bool)
+    opened_inv = opening_by_reconstruction(inv, ksize)
+    return ~opened_inv
+
+
+def reconstructive_cleanup(
+    mask: np.ndarray,
+    *,
+    open_frac: float,
+    close_frac: float,
+    min_keep_frac: float,
+) -> np.ndarray:
+    mask = mask.astype(bool)
+    if not mask.any():
+        return mask
+    orig_area = int(mask.sum())
+    open_k = _odd_kernel_from_frac(mask.shape, open_frac, minimum=3)
+    close_k = _odd_kernel_from_frac(mask.shape, close_frac, minimum=5)
+    out = opening_by_reconstruction(mask, open_k)
+    if out.any() and int(out.sum()) >= int(round(orig_area * min_keep_frac)):
+        mask = out
+    out = closing_by_reconstruction(mask, close_k)
+    if out.any():
+        mask = out
+    mask = binary_fill_holes(mask)
+    return mask
+
+
 def retain_core_overlapping_components(mask: np.ndarray, core: np.ndarray, *, overlap_frac: float = 0.03) -> np.ndarray:
     mask_u8 = mask.astype(np.uint8)
     num, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, 8)
@@ -348,6 +1160,42 @@ def hybrid_reconstruct(simple_mask: np.ndarray, core_mask: np.ndarray, *, erode_
     return recon
 
 
+def hybrid_reconstruct_m1(
+    simple_mask: np.ndarray,
+    core_mask: np.ndarray,
+    *,
+    erode_k: int,
+    core_dilate_k: int,
+    overlap_frac: float,
+    candidate_open_frac: float,
+    candidate_close_frac: float,
+    final_open_frac: float,
+    final_close_frac: float,
+    min_keep_frac: float,
+) -> np.ndarray:
+    simple_mask = reconstructive_cleanup(
+        simple_mask,
+        open_frac=candidate_open_frac,
+        close_frac=candidate_close_frac,
+        min_keep_frac=min_keep_frac,
+    )
+    recon = hybrid_reconstruct(
+        simple_mask,
+        core_mask,
+        erode_k=erode_k,
+        core_dilate_k=core_dilate_k,
+        overlap_frac=overlap_frac,
+        final_close_k=3,
+    )
+    recon = reconstructive_cleanup(
+        recon,
+        open_frac=final_open_frac,
+        close_frac=final_close_frac,
+        min_keep_frac=min_keep_frac,
+    )
+    return recon
+
+
 def method_factory() -> dict[str, callable]:
     cache: dict[tuple[str, int], np.ndarray] = {}
 
@@ -367,6 +1215,13 @@ def method_factory() -> dict[str, callable]:
             "legacy_simple",
             crop,
             lambda: compute_auto_masks(crop, "gallyas", method=MASK_PRESET_LEGACY_SIMPLE)[0] > 0,
+        )
+
+    def gui_hybrid_balanced_production(crop: np.ndarray) -> np.ndarray:
+        return cached(
+            "gui_hybrid_balanced_production",
+            crop,
+            lambda: compute_auto_masks(crop, "gallyas", method=MASK_PRESET_HYBRID_BALANCED)[0] > 0,
         )
 
     def simple(crop: np.ndarray) -> np.ndarray:
@@ -422,6 +1277,36 @@ def method_factory() -> dict[str, callable]:
             lambda: run_candidate_center_baseline(crop, candidate_mask=simple_tight_v1(crop), gallyas_max_components=2),
         )
 
+    def m2_candidate_union_v1(crop: np.ndarray) -> np.ndarray:
+        return cached(
+            "m2_candidate_union_v1",
+            crop,
+            lambda: entropy_residual_candidate(
+                crop,
+                ent_radius=5,
+                ent_q=0.68,
+                residual_scale=0.96,
+                nonwhite_min=18,
+                close_k=9,
+                open_k=3,
+            ),
+        )
+
+    def m2_candidate_union_v2(crop: np.ndarray) -> np.ndarray:
+        return cached(
+            "m2_candidate_union_v2",
+            crop,
+            lambda: entropy_residual_candidate(
+                crop,
+                ent_radius=7,
+                ent_q=0.64,
+                residual_scale=0.92,
+                nonwhite_min=16,
+                close_k=11,
+                open_k=3,
+            ),
+        )
+
     def hybrid_default_k5_o03(crop: np.ndarray) -> np.ndarray:
         return cached(
             "hybrid_default_k5_o03",
@@ -464,11 +1349,381 @@ def method_factory() -> dict[str, callable]:
             lambda: hybrid_reconstruct(simple_tight_v1(crop), center_default(crop), erode_k=7, core_dilate_k=21, overlap_frac=0.03, final_close_k=9),
         )
 
+    def m2_hybrid_entres_v1(crop: np.ndarray) -> np.ndarray:
+        return cached(
+            "m2_hybrid_entres_v1",
+            crop,
+            lambda: hybrid_reconstruct(m2_candidate_union_v1(crop), center_default(crop), erode_k=7, core_dilate_k=21, overlap_frac=0.03, final_close_k=9),
+        )
+
+    def m2_hybrid_entres_tight_v1(crop: np.ndarray) -> np.ndarray:
+        return cached(
+            "m2_hybrid_entres_tight_v1",
+            crop,
+            lambda: hybrid_reconstruct(
+                tighten_with_area_guard(m2_candidate_union_v1(crop), open_k=3, erode_k=3, min_keep_frac=0.92),
+                center_default(crop),
+                erode_k=7,
+                core_dilate_k=21,
+                overlap_frac=0.03,
+                final_close_k=9,
+            ),
+        )
+
+    def m2_hybrid_entres_guard_v1(crop: np.ndarray) -> np.ndarray:
+        return cached(
+            "m2_hybrid_entres_guard_v1",
+            crop,
+            lambda: fallback_if_too_small(
+                hybrid_reconstruct(m2_candidate_union_v2(crop), center_default(crop), erode_k=7, core_dilate_k=21, overlap_frac=0.03, final_close_k=9),
+                simple_tight_v1(crop),
+                min_frac_of_fallback=0.72,
+            ),
+        )
+
+    def m3_hyst_entres_v1(crop: np.ndarray) -> np.ndarray:
+        return cached(
+            "m3_hyst_entres_v1",
+            crop,
+            lambda: hysteresis_support_reconstruct(
+                m2_candidate_union_v1(crop),
+                residual_score(crop),
+                center_default(crop),
+                core_quantile=0.82,
+                core_scale=1.00,
+                overlap_frac=0.03,
+                core_open_k=3,
+                final_close_k=7,
+            ),
+        )
+
+    def m3_hyst_entres_tight_v1(crop: np.ndarray) -> np.ndarray:
+        return cached(
+            "m3_hyst_entres_tight_v1",
+            crop,
+            lambda: tighten_with_area_guard(
+                hysteresis_support_reconstruct(
+                    m2_candidate_union_v1(crop),
+                    residual_score(crop),
+                    center_default(crop),
+                    core_quantile=0.86,
+                    core_scale=1.02,
+                    overlap_frac=0.035,
+                    core_open_k=3,
+                    final_close_k=7,
+                ),
+                open_k=3,
+                erode_k=3,
+                min_keep_frac=0.92,
+            ),
+        )
+
+    def m3_hyst_entres_guard_v1(crop: np.ndarray) -> np.ndarray:
+        return cached(
+            "m3_hyst_entres_guard_v1",
+            crop,
+            lambda: fallback_if_too_small(
+                hysteresis_support_reconstruct(
+                    m2_candidate_union_v2(crop),
+                    residual_score(crop),
+                    center_default(crop),
+                    core_quantile=0.84,
+                    core_scale=1.00,
+                    overlap_frac=0.03,
+                    core_open_k=3,
+                    final_close_k=7,
+                ),
+                m2_hybrid_entres_tight_v1(crop),
+                min_frac_of_fallback=0.70,
+            ),
+        )
+
+    def m3_support_edgeaware_v1(crop: np.ndarray) -> np.ndarray:
+        return cached(
+            "m3_support_edgeaware_v1",
+            crop,
+            lambda: fallback_if_too_small(
+                hysteresis_support_reconstruct(
+                    edge_aware_support_mask(
+                        m2_candidate_union_v2(crop),
+                        binary_fill_holes(center_default(crop) | simple_tight_v1(crop)),
+                        np.maximum(residual_score(crop), entropy_score(crop, radius=5)),
+                        (255 - crop.min(axis=2)).astype(np.uint8),
+                        band_frac=0.08,
+                        lower_slack_frac=0.05,
+                        lateral_strip_frac=0.22,
+                        inner_anchor_frac=0.18,
+                        score_q=0.18,
+                        nonwhite_min=10,
+                        row_pad_frac=0.03,
+                        close_k=5,
+                    ),
+                    residual_score(crop),
+                    center_default(crop),
+                    core_quantile=0.84,
+                    core_scale=1.00,
+                    overlap_frac=0.03,
+                    core_open_k=3,
+                    final_close_k=7,
+                ),
+                m2_hybrid_entres_tight_v1(crop),
+                min_frac_of_fallback=0.70,
+            ),
+        )
+
+    def m3_support_edgeaware_bridge_v1(crop: np.ndarray) -> np.ndarray:
+        return cached(
+            "m3_support_edgeaware_bridge_v1",
+            crop,
+            lambda: fallback_if_too_small(
+                hysteresis_support_reconstruct(
+                    edge_aware_support_bridge_mask(
+                        m2_candidate_union_v2(crop),
+                        binary_fill_holes(center_default(crop) | simple_tight_v1(crop)),
+                        np.maximum(residual_score(crop), entropy_score(crop, radius=5)),
+                        (255 - crop.min(axis=2)).astype(np.uint8),
+                        band_frac=0.08,
+                        lower_slack_frac=0.05,
+                        lateral_strip_frac=0.22,
+                        inner_anchor_frac=0.18,
+                        score_q=0.14,
+                        nonwhite_min=8,
+                        row_pad_frac=0.03,
+                        min_bridge_span_frac=0.10,
+                        close_k=7,
+                    ),
+                    residual_score(crop),
+                    center_default(crop),
+                    core_quantile=0.84,
+                    core_scale=1.00,
+                    overlap_frac=0.03,
+                    core_open_k=3,
+                    final_close_k=7,
+                ),
+                m2_hybrid_entres_tight_v1(crop),
+                min_frac_of_fallback=0.70,
+            ),
+        )
+
+    def m3_hyst_entres_guard_edgefill_v1(crop: np.ndarray) -> np.ndarray:
+        return cached(
+            "m3_hyst_entres_guard_edgefill_v1",
+            crop,
+            lambda: fill_edge_touch_strips(
+                fallback_if_too_small(
+                    hysteresis_support_reconstruct(
+                        m2_candidate_union_v2(crop),
+                        residual_score(crop),
+                        center_default(crop),
+                        core_quantile=0.84,
+                        core_scale=1.00,
+                        overlap_frac=0.03,
+                        core_open_k=3,
+                        final_close_k=7,
+                    ),
+                    m2_hybrid_entres_tight_v1(crop),
+                    min_frac_of_fallback=0.70,
+                ),
+                m2_candidate_union_v2(crop),
+                strip_frac=0.06,
+                min_runs=2,
+                min_span_frac=0.12,
+                close_k=5,
+            ),
+        )
+
+    def edge_support_aug_v1(crop: np.ndarray) -> np.ndarray:
+        return cached(
+            "edge_support_aug_v1",
+            crop,
+            lambda: binary_fill_holes(
+                binary_propagation(
+                    m3_hyst_entres_guard_v1(crop),
+                    mask=edge_support_augment(
+                        m3_hyst_entres_guard_v1(crop),
+                        m2_candidate_union_v2(crop),
+                        np.maximum(residual_score(crop), entropy_score(crop, radius=5)),
+                        strip_frac=0.08,
+                        inner_frac=0.16,
+                        score_q=0.35,
+                        min_row_frac=0.05,
+                        row_pad_frac=0.03,
+                        close_k=5,
+                    ),
+                )
+            ),
+        )
+
+    def edge_run_completion_v1(crop: np.ndarray) -> np.ndarray:
+        return cached(
+            "edge_run_completion_v1",
+            crop,
+            lambda: edge_run_completion(
+                m3_hyst_entres_guard_v1(crop),
+                m2_candidate_union_v2(crop),
+                np.maximum(residual_score(crop), entropy_score(crop, radius=5)),
+                strip_frac=0.08,
+                depth=2,
+                min_runs=2,
+                min_span_frac=0.12,
+                row_pad_frac=0.03,
+                score_q=0.20,
+                close_k=5,
+            ),
+        )
+
+    def edge_top_envelope_v1(crop: np.ndarray) -> np.ndarray:
+        return cached(
+            "edge_top_envelope_v1",
+            crop,
+            lambda: top_envelope_lateral_completion(
+                m3_hyst_entres_guard_v1(crop),
+                m2_candidate_union_v2(crop),
+                np.maximum(residual_score(crop), entropy_score(crop, radius=5)),
+                (255 - crop.min(axis=2)).astype(np.uint8),
+                band_frac=0.08,
+                lower_slack_frac=0.05,
+                score_q=0.22,
+                nonwhite_min=10,
+                close_k=5,
+            ),
+        )
+
+    def edge_top_envelope_bridge_v1(crop: np.ndarray) -> np.ndarray:
+        return cached(
+            "edge_top_envelope_bridge_v1",
+            crop,
+            lambda: top_envelope_bridge_completion(
+                m3_hyst_entres_guard_v1(crop),
+                m2_candidate_union_v2(crop),
+                np.maximum(residual_score(crop), entropy_score(crop, radius=5)),
+                (255 - crop.min(axis=2)).astype(np.uint8),
+                band_frac=0.08,
+                lower_slack_frac=0.05,
+                score_q=0.16,
+                nonwhite_min=8,
+                min_bridge_cols_frac=0.08,
+                close_k=7,
+            ),
+        )
+
+    def m4_multicomp_entres_v1(crop: np.ndarray) -> np.ndarray:
+        return cached(
+            "m4_multicomp_entres_v1",
+            crop,
+            lambda: component_set_select(
+                m2_candidate_union_v1(crop),
+                score_core=center_default(crop),
+                support_mask=m2_candidate_union_v1(crop),
+                max_components=2,
+                min_area_frac=0.08,
+                bridge_erode_k=3,
+                core_dilate_k=17,
+                border_penalty=0.75,
+                min_score=0.10,
+                final_close_k=7,
+            ),
+        )
+
+    def m4_multicomp_entres_v2(crop: np.ndarray) -> np.ndarray:
+        return cached(
+            "m4_multicomp_entres_v2",
+            crop,
+            lambda: component_set_select(
+                m2_candidate_union_v2(crop),
+                score_core=center_default(crop),
+                support_mask=m2_candidate_union_v1(crop),
+                max_components=3,
+                min_area_frac=0.06,
+                bridge_erode_k=3,
+                core_dilate_k=17,
+                border_penalty=0.85,
+                min_score=0.06,
+                final_close_k=7,
+            ),
+        )
+
+    def m4_multicomp_guard_v1(crop: np.ndarray) -> np.ndarray:
+        return cached(
+            "m4_multicomp_guard_v1",
+            crop,
+            lambda: fallback_if_too_small(
+                component_set_select(
+                    m2_candidate_union_v2(crop),
+                    score_core=m3_hyst_entres_guard_v1(crop),
+                    support_mask=m2_candidate_union_v2(crop),
+                    max_components=2,
+                    min_area_frac=0.06,
+                    bridge_erode_k=3,
+                    core_dilate_k=13,
+                    border_penalty=0.95,
+                    min_score=0.05,
+                    final_close_k=5,
+                ),
+                m3_hyst_entres_guard_v1(crop),
+                min_frac_of_fallback=0.72,
+            ),
+        )
+
     def hybrid_tightcand_k5_o05(crop: np.ndarray) -> np.ndarray:
         return cached(
             "hybrid_tightcand_k5_o05",
             crop,
             lambda: hybrid_reconstruct(simple_tight_v2(crop), center_default(crop), erode_k=5, core_dilate_k=17, overlap_frac=0.05, final_close_k=7),
+        )
+
+    def m1_hybrid_tightcand_recon_v1(crop: np.ndarray) -> np.ndarray:
+        return cached(
+            "m1_hybrid_tightcand_recon_v1",
+            crop,
+            lambda: hybrid_reconstruct_m1(
+                simple_tight_v1(crop),
+                center_default(crop),
+                erode_k=7,
+                core_dilate_k=21,
+                overlap_frac=0.03,
+                candidate_open_frac=0.0045,
+                candidate_close_frac=0.0065,
+                final_open_frac=0.0035,
+                final_close_frac=0.0055,
+                min_keep_frac=0.92,
+            ),
+        )
+
+    def m1_hybrid_tightcand_recon_v2(crop: np.ndarray) -> np.ndarray:
+        return cached(
+            "m1_hybrid_tightcand_recon_v2",
+            crop,
+            lambda: hybrid_reconstruct_m1(
+                simple_tight_v1(crop),
+                center_default(crop),
+                erode_k=7,
+                core_dilate_k=21,
+                overlap_frac=0.03,
+                candidate_open_frac=0.0055,
+                candidate_close_frac=0.0075,
+                final_open_frac=0.0040,
+                final_close_frac=0.0060,
+                min_keep_frac=0.90,
+            ),
+        )
+
+    def m1_hybrid_default_recon_v1(crop: np.ndarray) -> np.ndarray:
+        return cached(
+            "m1_hybrid_default_recon_v1",
+            crop,
+            lambda: hybrid_reconstruct_m1(
+                simple(crop),
+                center_default(crop),
+                erode_k=7,
+                core_dilate_k=21,
+                overlap_frac=0.03,
+                candidate_open_frac=0.0045,
+                candidate_close_frac=0.0065,
+                final_open_frac=0.0035,
+                final_close_frac=0.0055,
+                min_keep_frac=0.92,
+            ),
         )
 
     def hybrid_loose_k5_o03(crop: np.ndarray) -> np.ndarray:
@@ -522,19 +1777,41 @@ def method_factory() -> dict[str, callable]:
 
     return {
         "legacy_simple": legacy,
+        "gui_hybrid_balanced_production": gui_hybrid_balanced_production,
         "simple_conservative": simple,
         "simple_tight_v1": simple_tight_v1,
         "simple_tight_v2": simple_tight_v2,
         "crop_center_default2comp": center_default,
         "crop_center_loose2comp": center_loose,
         "candidate_center_default2comp": candidate_center_default,
+        "m2_candidate_union_v1": m2_candidate_union_v1,
+        "m2_candidate_union_v2": m2_candidate_union_v2,
         "hybrid_default_k5_o03": hybrid_default_k5_o03,
         "hybrid_default_k7_o03": hybrid_default_k7_o03,
         "hybrid_default_k7_o03_posttight_v1": hybrid_default_k7_o03_posttight_v1,
         "hybrid_default_k7_o03_posttight_v2": hybrid_default_k7_o03_posttight_v2,
         "hybrid_default_k5_o05": hybrid_default_k5_o05,
         "hybrid_tightcand_k7_o03": hybrid_tightcand_k7_o03,
+        "m2_hybrid_entres_v1": m2_hybrid_entres_v1,
+        "m2_hybrid_entres_tight_v1": m2_hybrid_entres_tight_v1,
+        "m2_hybrid_entres_guard_v1": m2_hybrid_entres_guard_v1,
+        "m3_hyst_entres_v1": m3_hyst_entres_v1,
+        "m3_hyst_entres_tight_v1": m3_hyst_entres_tight_v1,
+        "m3_hyst_entres_guard_v1": m3_hyst_entres_guard_v1,
+        "m3_support_edgeaware_v1": m3_support_edgeaware_v1,
+        "m3_support_edgeaware_bridge_v1": m3_support_edgeaware_bridge_v1,
+        "m3_hyst_entres_guard_edgefill_v1": m3_hyst_entres_guard_edgefill_v1,
+        "edge_support_aug_v1": edge_support_aug_v1,
+        "edge_run_completion_v1": edge_run_completion_v1,
+        "edge_top_envelope_v1": edge_top_envelope_v1,
+        "edge_top_envelope_bridge_v1": edge_top_envelope_bridge_v1,
+        "m4_multicomp_entres_v1": m4_multicomp_entres_v1,
+        "m4_multicomp_entres_v2": m4_multicomp_entres_v2,
+        "m4_multicomp_guard_v1": m4_multicomp_guard_v1,
         "hybrid_tightcand_k5_o05": hybrid_tightcand_k5_o05,
+        "m1_hybrid_tightcand_recon_v1": m1_hybrid_tightcand_recon_v1,
+        "m1_hybrid_tightcand_recon_v2": m1_hybrid_tightcand_recon_v2,
+        "m1_hybrid_default_recon_v1": m1_hybrid_default_recon_v1,
         "hybrid_loose_k5_o03": hybrid_loose_k5_o03,
         "hybrid_loose_k7_o03": hybrid_loose_k7_o03,
         "hybrid_loose_k5_o05": hybrid_loose_k5_o05,

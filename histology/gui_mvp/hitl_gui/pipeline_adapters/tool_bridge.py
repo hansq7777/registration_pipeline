@@ -45,6 +45,8 @@ def proposal_to_tool_candidate(proposal: ProposalBox, rank: int | None = None):
 
 
 def proposal_crop_rect_overview_gui(loaded_slide: LoadedSlide, proposal: ProposalBox) -> tuple[int, int, int, int]:
+    if loaded_slide.stain.lower() == "gallyas":
+        return proposal.x, proposal.y, proposal.x + proposal.w, proposal.y + proposal.h
     tool = load_histology_tool_module()
     overview_rgb = np.asarray(loaded_slide.overview)
     candidate = proposal_to_tool_candidate(proposal)

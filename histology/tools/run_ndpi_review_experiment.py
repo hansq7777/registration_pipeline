@@ -302,6 +302,339 @@ def gallyas_overview_hybrid_score(overview_rgb: np.ndarray) -> np.ndarray:
     return np.maximum(residual, legacy_score).astype(np.uint8)
 
 
+def gallyas_overview_localadaptive_mask(overview_rgb: np.ndarray, window_ratio: float = 0.09, k: float = 0.22) -> np.ndarray:
+    gray = cv2.cvtColor(overview_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    h, w = gray.shape[:2]
+    win = max(15, int(round(min(h, w) * window_ratio)))
+    if win % 2 == 0:
+        win += 1
+    mean = cv2.boxFilter(gray, ddepth=cv2.CV_32F, ksize=(win, win), normalize=True)
+    sqmean = cv2.boxFilter(gray * gray, ddepth=cv2.CV_32F, ksize=(win, win), normalize=True)
+    var = np.maximum(sqmean - mean * mean, 0.0)
+    std = np.sqrt(var)
+    thresh = mean * (1.0 + k * ((std / 128.0) - 1.0))
+    mask = gray <= thresh
+    mask = cv2.morphologyEx((mask.astype(np.uint8) * 255), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)) > 0
+    mask = cv2.morphologyEx((mask.astype(np.uint8) * 255), cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8)) > 0
+    return mask.astype(np.uint8) * 255
+
+
+def _best_component_near_center_runtime(mask: np.ndarray, center_xy: tuple[float, float]) -> np.ndarray:
+    mask_u8 = (mask > 0).astype(np.uint8)
+    n, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
+    if n <= 1:
+        return mask_u8 > 0
+    cx, cy = center_xy
+    best_idx = 0
+    best_score = -1e18
+    for idx in range(1, n):
+        area = float(stats[idx, cv2.CC_STAT_AREA])
+        px, py = centroids[idx]
+        dist = math.hypot(float(px) - cx, float(py) - cy)
+        score = area - 2.5 * dist
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+    return labels == best_idx
+
+
+def _candidate_core_mask_runtime(
+    candidate: CandidateBox,
+    core_score: np.ndarray,
+    *,
+    core_quantile: float = 0.86,
+    min_thresh: int = 10,
+) -> np.ndarray:
+    h, w = core_score.shape[:2]
+    x1, y1, x2, y2 = clamp_rect(candidate.x, candidate.y, candidate.x + candidate.w, candidate.y + candidate.h, (w, h))
+    patch = core_score[y1:y2, x1:x2]
+    vals = patch[patch > 0]
+    core_local = np.zeros_like(patch, dtype=bool)
+    if vals.size > 0:
+        thresh = max(min_thresh, int(round(float(np.quantile(vals, core_quantile)))))
+        core_local = patch >= thresh
+        core_local = cv2.morphologyEx((core_local.astype(np.uint8) * 255), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)) > 0
+        core_local = cv2.morphologyEx((core_local.astype(np.uint8) * 255), cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)) > 0
+        if core_local.any():
+            core_local = _best_component_near_center_runtime(core_local, (candidate.cx - x1, candidate.cy - y1))
+    if not core_local.any():
+        cx = int(round(min(max(0.0, candidate.cx - x1), max(0, x2 - x1 - 1))))
+        cy = int(round(min(max(0.0, candidate.cy - y1), max(0, y2 - y1 - 1))))
+        rr = max(2, int(round(max(candidate.w, candidate.h) * 0.03)))
+        yy, xx = np.ogrid[: (y2 - y1), : (x2 - x1)]
+        core_local = ((xx - cx) ** 2 + (yy - cy) ** 2) <= (rr * rr)
+    full = np.zeros((h, w), dtype=bool)
+    full[y1:y2, x1:x2] = core_local
+    return full
+
+
+def _weak_support_mask_runtime(
+    fringe_score: np.ndarray,
+    *,
+    fringe_quantile: float = 0.55,
+    fringe_scale: float = 0.94,
+) -> np.ndarray:
+    vals = fringe_score[fringe_score > 0]
+    if vals.size == 0:
+        return np.zeros_like(fringe_score, dtype=bool)
+    thresh = max(6, int(round(float(np.quantile(vals, fringe_quantile)) * fringe_scale)))
+    mask = fringe_score >= thresh
+    mask = cv2.morphologyEx((mask.astype(np.uint8) * 255), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)) > 0
+    mask = cv2.morphologyEx((mask.astype(np.uint8) * 255), cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8)) > 0
+    return mask
+
+
+def _bbox_from_mask_runtime(mask: np.ndarray, overview_shape_wh: Tuple[int, int], pad_ratio: float = 0.035, min_pad: int = 6) -> Tuple[int, int, int, int]:
+    ys, xs = np.where(mask)
+    if xs.size == 0:
+        return 0, 0, overview_shape_wh[0], overview_shape_wh[1]
+    x1 = int(xs.min())
+    y1 = int(ys.min())
+    x2 = int(xs.max()) + 1
+    y2 = int(ys.max()) + 1
+    pad = max(min_pad, int(round(max(x2 - x1, y2 - y1) * pad_ratio)))
+    return clamp_rect(x1 - pad, y1 - pad, x2 + pad, y2 + pad, overview_shape_wh)
+
+
+def _expand_rect_horizontal_runtime(
+    rect: Tuple[int, int, int, int],
+    overview_shape_wh: Tuple[int, int],
+    *,
+    side_ratio: float = 0.025,
+    min_pad: int = 6,
+) -> Tuple[int, int, int, int]:
+    x1, y1, x2, y2 = rect
+    width = max(1, x2 - x1)
+    pad = max(min_pad, int(round(width * side_ratio)))
+    return clamp_rect(x1 - pad, y1, x2 + pad, y2, overview_shape_wh)
+
+
+def _competitive_support_bbox_runtime(
+    target_candidate: CandidateBox,
+    all_candidates: Sequence[CandidateBox],
+    overview_shape_wh: Tuple[int, int],
+    core_score: np.ndarray,
+    fringe_score: np.ndarray,
+    *,
+    core_quantile: float = 0.86,
+    fringe_quantile: float = 0.55,
+    fringe_scale: float = 0.94,
+    pad_ratio: float = 0.035,
+) -> Tuple[int, int, int, int]:
+    if not all_candidates:
+        return clamp_rect(
+            target_candidate.x,
+            target_candidate.y,
+            target_candidate.x + target_candidate.w,
+            target_candidate.y + target_candidate.h,
+            overview_shape_wh,
+        )
+
+    seed_masks = [
+        _candidate_core_mask_runtime(cand, core_score, core_quantile=core_quantile)
+        for cand in all_candidates
+    ]
+    dilated_seeds = [
+        cv2.dilate((seed.astype(np.uint8) * 255), np.ones((3, 3), np.uint8), iterations=1) > 0
+        for seed in seed_masks
+    ]
+    weak_support = _weak_support_mask_runtime(
+        fringe_score,
+        fringe_quantile=fringe_quantile,
+        fringe_scale=fringe_scale,
+    )
+    if dilated_seeds:
+        seed_union = np.zeros_like(weak_support, dtype=bool)
+        for seed in dilated_seeds:
+            seed_union |= seed
+        weak_support |= seed_union
+
+    n, labels, _, _ = cv2.connectedComponentsWithStats(weak_support.astype(np.uint8), connectivity=8)
+    centers = np.array([(cand.cx, cand.cy) for cand in all_candidates], dtype=np.float32)
+    target_idx = 0
+    for idx, cand in enumerate(all_candidates):
+        if cand.section is not None and target_candidate.section is not None and cand.section.short_label == target_candidate.section.short_label:
+            target_idx = idx
+            break
+        if cand.candidate_rank == target_candidate.candidate_rank:
+            target_idx = idx
+            break
+
+    owned = np.zeros_like(weak_support, dtype=bool)
+    for comp_idx in range(1, n):
+        comp = labels == comp_idx
+        if not comp.any():
+            continue
+        contenders: list[int] = []
+        for idx, seed in enumerate(dilated_seeds):
+            if np.any(comp & seed):
+                contenders.append(idx)
+        if not contenders:
+            continue
+        if len(contenders) == 1:
+            if contenders[0] == target_idx:
+                owned |= comp
+            continue
+        ys, xs = np.where(comp)
+        comp_centers = centers[np.asarray(contenders, dtype=np.int32)]
+        d2 = (xs[:, None] - comp_centers[:, 0][None, :]) ** 2 + (ys[:, None] - comp_centers[:, 1][None, :]) ** 2
+        winners = np.argmin(d2, axis=1)
+        target_local = None
+        for local_idx, contender_idx in enumerate(contenders):
+            if contender_idx == target_idx:
+                target_local = local_idx
+                break
+        if target_local is None:
+            continue
+        keep = winners == target_local
+        if np.any(keep):
+            owned[ys[keep], xs[keep]] = True
+
+    owned |= seed_masks[target_idx]
+    owned = cv2.morphologyEx((owned.astype(np.uint8) * 255), cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)) > 0
+    owned = binary_fill_holes(owned)
+    if not owned.any():
+        return clamp_rect(
+            target_candidate.x,
+            target_candidate.y,
+            target_candidate.x + target_candidate.w,
+            target_candidate.y + target_candidate.h,
+            overview_shape_wh,
+        )
+    return _bbox_from_mask_runtime(owned, overview_shape_wh, pad_ratio=pad_ratio)
+
+
+def _competitive_support_bboxes_runtime(
+    all_candidates: Sequence[CandidateBox],
+    overview_shape_wh: Tuple[int, int],
+    core_score: np.ndarray,
+    fringe_score: np.ndarray,
+    *,
+    core_quantile: float = 0.86,
+    fringe_quantile: float = 0.55,
+    fringe_scale: float = 0.94,
+    pad_ratio: float = 0.035,
+) -> List[Tuple[int, int, int, int]]:
+    if not all_candidates:
+        return []
+
+    seed_masks = [
+        _candidate_core_mask_runtime(cand, core_score, core_quantile=core_quantile)
+        for cand in all_candidates
+    ]
+    dilated_seeds = [
+        cv2.dilate((seed.astype(np.uint8) * 255), np.ones((3, 3), np.uint8), iterations=1) > 0
+        for seed in seed_masks
+    ]
+    weak_support = _weak_support_mask_runtime(
+        fringe_score,
+        fringe_quantile=fringe_quantile,
+        fringe_scale=fringe_scale,
+    )
+    if dilated_seeds:
+        seed_union = np.zeros_like(weak_support, dtype=bool)
+        for seed in dilated_seeds:
+            seed_union |= seed
+        weak_support |= seed_union
+
+    n, labels, _, _ = cv2.connectedComponentsWithStats(weak_support.astype(np.uint8), connectivity=8)
+    centers = np.array([(cand.cx, cand.cy) for cand in all_candidates], dtype=np.float32)
+    contenders_per_comp: List[List[int]] = [[] for _ in range(max(1, n))]
+    for idx, seed in enumerate(dilated_seeds):
+        comp_ids = np.unique(labels[seed])
+        comp_ids = comp_ids[comp_ids > 0]
+        for comp_id in comp_ids.tolist():
+            contenders_per_comp[int(comp_id)].append(idx)
+
+    owner_map = np.full(weak_support.shape, -1, dtype=np.int16)
+    for comp_idx in range(1, n):
+        contenders = contenders_per_comp[comp_idx]
+        if not contenders:
+            continue
+        comp = labels == comp_idx
+        if len(contenders) == 1:
+            owner_map[comp] = int(contenders[0])
+            continue
+        ys, xs = np.where(comp)
+        comp_centers = centers[np.asarray(contenders, dtype=np.int32)]
+        d2 = (xs[:, None] - comp_centers[:, 0][None, :]) ** 2 + (ys[:, None] - comp_centers[:, 1][None, :]) ** 2
+        winners = np.argmin(d2, axis=1)
+        owner_map[ys, xs] = np.asarray(contenders, dtype=np.int16)[winners]
+
+    rects: List[Tuple[int, int, int, int]] = []
+    for idx, cand in enumerate(all_candidates):
+        owned = owner_map == idx
+        owned |= seed_masks[idx]
+        owned = cv2.morphologyEx((owned.astype(np.uint8) * 255), cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)) > 0
+        owned = binary_fill_holes(owned)
+        if not owned.any():
+            rects.append(
+                clamp_rect(
+                    cand.x,
+                    cand.y,
+                    cand.x + cand.w,
+                    cand.y + cand.h,
+                    overview_shape_wh,
+                )
+            )
+            continue
+        rects.append(_bbox_from_mask_runtime(owned, overview_shape_wh, pad_ratio=pad_ratio))
+    return rects
+
+
+def gallyas_proposal_rects_overview(
+    overview_rgb: np.ndarray,
+    all_candidates: Sequence[CandidateBox],
+) -> List[Tuple[int, int, int, int]]:
+    overview_shape_wh = overview_rgb.shape[1], overview_rgb.shape[0]
+    if not all_candidates:
+        return []
+    residual = gallyas_overview_residual(overview_rgb)
+    hybrid = gallyas_overview_hybrid_score(overview_rgb)
+    adaptive = gallyas_overview_localadaptive_mask(overview_rgb)
+    fringe = np.maximum(hybrid, adaptive).astype(np.uint8)
+    if len(all_candidates) <= 1:
+        rects = []
+        for candidate in all_candidates:
+            top_bias = expand_candidate_rect(
+                candidate,
+                overview_shape_wh,
+                left_ratio=0.24,
+                top_ratio=0.24,
+                right_ratio=0.24,
+                bottom_ratio=0.24,
+            )
+            proj = projection_expand_rect(
+                candidate,
+                hybrid,
+                overview_shape_wh,
+                top_cap_ratio=0.48,
+                bottom_cap_ratio=0.22,
+                side_cap_ratio=0.18,
+                top_only=False,
+                thresh_scale=0.32,
+                max_gap=6,
+            )
+            rect = union_rect(top_bias, proj, overview_shape_wh)
+            rects.append(_expand_rect_horizontal_runtime(rect, overview_shape_wh, side_ratio=0.025, min_pad=6))
+        return rects
+
+    rects = _competitive_support_bboxes_runtime(
+        all_candidates,
+        overview_shape_wh,
+        residual,
+        fringe,
+        core_quantile=0.86,
+        fringe_quantile=0.55,
+        fringe_scale=0.94,
+        pad_ratio=0.035,
+    )
+    return [
+        _expand_rect_horizontal_runtime(rect, overview_shape_wh, side_ratio=0.025, min_pad=6)
+        for rect in rects
+    ]
+
+
 def projection_expand_rect(
     candidate: CandidateBox,
     overview_score: np.ndarray,
@@ -378,7 +711,12 @@ def projection_expand_rect(
     return clamp_rect(x1b - add_left, y1b - add_top, x2b + add_right, y2b + add_bottom, overview_shape_wh)
 
 
-def proposal_crop_rect_overview(candidate: CandidateBox, overview_rgb: np.ndarray, stain: str) -> Tuple[int, int, int, int]:
+def proposal_crop_rect_overview(
+    candidate: CandidateBox,
+    overview_rgb: np.ndarray,
+    stain: str,
+    all_candidates: Optional[Sequence[CandidateBox]] = None,
+) -> Tuple[int, int, int, int]:
     overview_shape_wh = overview_rgb.shape[1], overview_rgb.shape[0]
     if stain.lower() != "gallyas":
         return expand_candidate_rect(
@@ -389,6 +727,37 @@ def proposal_crop_rect_overview(candidate: CandidateBox, overview_rgb: np.ndarra
             right_ratio=0.08,
             bottom_ratio=0.08,
         )
+
+    residual = gallyas_overview_residual(overview_rgb)
+    hybrid = gallyas_overview_hybrid_score(overview_rgb)
+    adaptive = gallyas_overview_localadaptive_mask(overview_rgb)
+    fringe = np.maximum(hybrid, adaptive).astype(np.uint8)
+    if all_candidates and len(all_candidates) > 1:
+        rects = _competitive_support_bboxes_runtime(
+            all_candidates,
+            overview_shape_wh,
+            residual,
+            fringe,
+            core_quantile=0.86,
+            fringe_quantile=0.55,
+            fringe_scale=0.94,
+            pad_ratio=0.035,
+        )
+        target_idx = 0
+        for idx, cand in enumerate(all_candidates):
+            if cand.section is not None and candidate.section is not None and cand.section.short_label == candidate.section.short_label:
+                target_idx = idx
+                break
+            if cand.candidate_rank == candidate.candidate_rank:
+                target_idx = idx
+                break
+        rect = rects[target_idx] if rects else (
+            candidate.x,
+            candidate.y,
+            candidate.x + candidate.w,
+            candidate.y + candidate.h,
+        )
+        return _expand_rect_horizontal_runtime(rect, overview_shape_wh, side_ratio=0.025, min_pad=6)
 
     top_bias = expand_candidate_rect(
         candidate,
@@ -409,7 +778,8 @@ def proposal_crop_rect_overview(candidate: CandidateBox, overview_rgb: np.ndarra
         thresh_scale=0.32,
         max_gap=6,
     )
-    return union_rect(top_bias, proj, overview_shape_wh)
+    rect = union_rect(top_bias, proj, overview_shape_wh)
+    return _expand_rect_horizontal_runtime(rect, overview_shape_wh, side_ratio=0.025, min_pad=6)
 
 
 def split_candidates_into_rows(candidates: Sequence[CandidateBox]) -> List[List[CandidateBox]]:
@@ -1718,7 +2088,7 @@ def main() -> None:
     for idx, candidate in enumerate(candidates, start=1):
         label = candidate.section.short_label if candidate.section else f"cand_{idx}"
         print(f"[crop] {idx}/{len(candidates)} {label}", flush=True)
-        crop_bbox_overview = proposal_crop_rect_overview(candidate, overview_rgb, stain)
+        crop_bbox_overview = proposal_crop_rect_overview(candidate, overview_rgb, stain, candidates)
         bbox_level0 = convert_bbox_to_level0(slide, crop_bbox_overview)
         crop_rgb = extract_crop(slide, bbox_level0, args.crop_level)
         ownership_strict, ownership_soft, support_mask = build_crop_ownership_masks(
