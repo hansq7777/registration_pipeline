@@ -26,6 +26,8 @@ class MaskEditorLabel(QWidget):
         self.base_pixmap: Optional[QPixmap] = None
         self.overlay_rgba_display: Optional[np.ndarray] = None
         self.overlay_pixmap: Optional[QPixmap] = None
+        self.aux_overlay_rgba_display: Optional[np.ndarray] = None
+        self.aux_overlay_pixmap: Optional[QPixmap] = None
         self.stroke_mask_display: Optional[np.ndarray] = None
         self.stroke_rgba_display: Optional[np.ndarray] = None
         self.stroke_pixmap: Optional[QPixmap] = None
@@ -72,6 +74,7 @@ class MaskEditorLabel(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMinimumSize(900, 700)
         self.setAutoFillBackground(False)
+        self._update_cursor()
 
     def set_section(self, raw_rgb: np.ndarray, tissue_mask: np.ndarray, artifact_mask: np.ndarray) -> None:
         self.raw_rgb_full = raw_rgb.copy()
@@ -83,15 +86,35 @@ class MaskEditorLabel(QWidget):
         self._stroke_dirty_display_rect = None
         self._undo_stack = []
         self.component_group_marks = {}
+        self.aux_overlay_rgba_display = None
+        self.aux_overlay_pixmap = None
         self.zoom_factor = 1.0
         self.pan_offset = QPointF(0.0, 0.0)
         self._rebuild_display_buffers()
+        self._update_cursor()
         self.refresh()
 
     def set_active_layer(self, layer: str) -> None:
         if layer not in {"tissue", "artifact"}:
             return
         self.active_layer = layer
+        self.refresh()
+
+    def set_aux_overlay_rgba(self, overlay_rgba: np.ndarray | None) -> None:
+        if overlay_rgba is None or self.raw_rgb_display is None:
+            self.aux_overlay_rgba_display = None
+            self.aux_overlay_pixmap = None
+            self.refresh()
+            return
+        target_hw = self.raw_rgb_display.shape[:2]
+        if overlay_rgba.shape[:2] != target_hw:
+            overlay_rgba = cv2.resize(
+                overlay_rgba.astype(np.uint8),
+                (target_hw[1], target_hw[0]),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        self.aux_overlay_rgba_display = overlay_rgba.astype(np.uint8)
+        self.aux_overlay_pixmap = QPixmap.fromImage(qimage_from_rgba_array(self.aux_overlay_rgba_display))
         self.refresh()
 
     def set_brush_radius(self, radius: int) -> None:
@@ -129,7 +152,20 @@ class MaskEditorLabel(QWidget):
         self.brush_enabled = enabled
         if not self.brush_enabled:
             self._set_hover_coord(None)
+        self._update_cursor()
         self.refresh()
+
+    def _update_cursor(self) -> None:
+        if self._panning:
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            return
+        if self._line_erase_active:
+            self.setCursor(Qt.CursorShape.CrossCursor)
+            return
+        if self.brush_enabled:
+            self.setCursor(Qt.CursorShape.CrossCursor)
+            return
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
 
     def toggle_hand_override(self) -> bool:
         if self._line_erase_active:
@@ -137,16 +173,20 @@ class MaskEditorLabel(QWidget):
             self._brush_enabled_before_line_erase = None
             self._line_erase_start_display = None
             self._line_erase_preview_end_display = None
+            self._update_cursor()
         if self._hand_override_active:
             self._hand_override_active = False
             restore_brush = self._brush_enabled_before_hand_override
             self._brush_enabled_before_hand_override = None
             if restore_brush:
                 self._set_brush_enabled(True)
+            else:
+                self._update_cursor()
             self.refresh()
             return not self.brush_enabled
 
         if not self.brush_enabled:
+            self._update_cursor()
             self.refresh()
             return True
 
@@ -158,22 +198,22 @@ class MaskEditorLabel(QWidget):
     def toggle_line_erase_mode(self) -> bool:
         if self._line_erase_active:
             self._line_erase_active = False
-            restore_brush = self._brush_enabled_before_line_erase
             self._brush_enabled_before_line_erase = None
             self._line_erase_start_display = None
             self._line_erase_preview_end_display = None
-            if restore_brush:
-                self._set_brush_enabled(True)
+            self._set_brush_enabled(False)
+            self._update_cursor()
             self.refresh()
             return False
 
-        self._brush_enabled_before_line_erase = self.brush_enabled
+        self._brush_enabled_before_line_erase = None
         self._hand_override_active = False
         self._brush_enabled_before_hand_override = None
         self._set_brush_enabled(False)
         self._line_erase_active = True
         self._line_erase_start_display = None
         self._line_erase_preview_end_display = None
+        self._update_cursor()
         self.refresh()
         return True
 
@@ -331,6 +371,8 @@ class MaskEditorLabel(QWidget):
             self.base_pixmap = None
             self.overlay_rgba_display = None
             self.overlay_pixmap = None
+            self.aux_overlay_rgba_display = None
+            self.aux_overlay_pixmap = None
             self.stroke_mask_display = None
             self.stroke_rgba_display = None
             self.stroke_pixmap = None
@@ -534,7 +576,7 @@ class MaskEditorLabel(QWidget):
         p2 = end if end is not None else self._line_erase_preview_end_display
         if p1 is None or p2 is None:
             return QRect()
-        rect = self._display_rect_from_points([p1, p2], radius=4)
+        rect = self._display_rect_from_points([p1, p2], radius=10)
         return self._display_rect_to_widget_rect(rect)
 
     def _update_widget_rect(self, rect: QRect) -> None:
@@ -694,6 +736,8 @@ class MaskEditorLabel(QWidget):
             painter.drawPixmap(target, self.base_pixmap, source_rect)
         if self.overlay_visible and self.overlay_pixmap is not None:
             painter.drawPixmap(target, self.overlay_pixmap, QRectF(self.overlay_pixmap.rect()))
+        if self.aux_overlay_pixmap is not None:
+            painter.drawPixmap(target, self.aux_overlay_pixmap, QRectF(self.aux_overlay_pixmap.rect()))
         if self.stroke_pixmap is not None:
             painter.drawPixmap(target, self.stroke_pixmap, QRectF(self.stroke_pixmap.rect()))
 
@@ -733,13 +777,22 @@ class MaskEditorLabel(QWidget):
             ex, ey = self._line_erase_preview_end_display
             p1 = QPointF(target.x() + (sx + 0.5) * self.view_scale, target.y() + (sy + 0.5) * self.view_scale)
             p2 = QPointF(target.x() + (ex + 0.5) * self.view_scale, target.y() + (ey + 0.5) * self.view_scale)
-            pen = QPen(QColor(255, 255, 80, 220), max(2.0, 2.0 * self.view_scale))
-            painter.setPen(pen)
+            outer_pen = QPen(QColor(255, 64, 64, 170), max(8.0, 6.0 * self.view_scale))
+            outer_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(outer_pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawLine(p1, p2)
-            painter.setBrush(QColor(255, 255, 80, 180))
-            painter.drawEllipse(p1, max(3.0, 3.0 * self.view_scale), max(3.0, 3.0 * self.view_scale))
-            painter.drawEllipse(p2, max(3.0, 3.0 * self.view_scale), max(3.0, 3.0 * self.view_scale))
+            inner_pen = QPen(QColor(255, 255, 160, 245), max(3.0, 2.5 * self.view_scale))
+            inner_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(inner_pen)
+            painter.drawLine(p1, p2)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(255, 64, 64, 210))
+            painter.drawEllipse(p1, max(6.0, 5.0 * self.view_scale), max(6.0, 5.0 * self.view_scale))
+            painter.drawEllipse(p2, max(6.0, 5.0 * self.view_scale), max(6.0, 5.0 * self.view_scale))
+            painter.setBrush(QColor(255, 255, 180, 240))
+            painter.drawEllipse(p1, max(3.0, 2.5 * self.view_scale), max(3.0, 2.5 * self.view_scale))
+            painter.drawEllipse(p2, max(3.0, 2.5 * self.view_scale), max(3.0, 2.5 * self.view_scale))
 
         if self.brush_enabled and self.hover_pos_display is not None:
             hx, hy = self.hover_pos_display
@@ -791,6 +844,7 @@ class MaskEditorLabel(QWidget):
             self._panning = True
             self._pan_start_widget = event.position().toPoint()
             self._pan_start_offset = QPointF(self.pan_offset)
+            self._update_cursor()
             event.accept()
             return
         if event.button() == Qt.MouseButton.LeftButton:
@@ -841,6 +895,7 @@ class MaskEditorLabel(QWidget):
             self.on_painting_state_changed(False)
         if was_panning:
             event.accept()
+        self._update_cursor()
         super().mouseReleaseEvent(event)
 
     def wheelEvent(self, event: QWheelEvent) -> None:
@@ -954,6 +1009,10 @@ class MaskEditorLabel(QWidget):
         start = self._line_erase_start_display
         self._rebuild_display_buffers()
         self._set_line_erase_preview(None, None)
+        self._line_erase_active = False
+        self._brush_enabled_before_line_erase = None
+        self._set_brush_enabled(False)
+        self._update_cursor()
         self.refresh()
         if self.on_mask_changed is not None:
             self.on_mask_changed()

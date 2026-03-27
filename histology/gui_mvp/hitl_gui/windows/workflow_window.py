@@ -3,9 +3,11 @@ from __future__ import annotations
 import ctypes
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import os
 import threading
 import traceback
 from pathlib import Path
+import shlex
 import sys
 from time import perf_counter
 from typing import Callable
@@ -14,12 +16,13 @@ import json
 import cv2
 import numpy as np
 from PySide6.QtCore import QObject, QThread, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QPen
+from PySide6.QtGui import QColor, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QGraphicsRectItem,
     QHBoxLayout,
     QLabel,
@@ -57,6 +60,29 @@ from ..application.pair_workspace import (
     pair_registration_mask_paths,
     save_pair_registry,
 )
+from ..application.pair_registration import (
+    PairRegistrationConfig,
+    default_pair_registration_runs_root,
+    find_ants_bin,
+    latest_registration_run_dir,
+    run_pair_registration,
+)
+from ..application.roi_mapping import (
+    current_step6_state,
+    default_pair_roi_root,
+    load_approved_registration_context,
+    save_step6_roi as save_step6_roi_outputs,
+    update_step6_roi_mapping,
+)
+from ..application.confocal_registration import (
+    ConfocalRigidConfig,
+    apply_manual_transform,
+    default_confocal_registration_root,
+    infer_stack_channel_count,
+    prepare_myelin_confocal_fixed,
+    project_confocal_stack,
+    run_confocal_rigid_registration,
+)
 from ..db import connect_db, transaction
 from ..domain import LoadedSlide, ProposalBox
 from ..pipeline_adapters import (
@@ -76,7 +102,7 @@ from ..pipeline_adapters import (
 )
 from ..pipeline_adapters.slide_io import effective_crop_rect_overview, open_slide_handle
 from ..repositories import RevisionRepository, SectionRepository
-from ..widgets.graphics import DraggableProposalItem, ImageSceneView
+from ..widgets.graphics import DraggableProposalItem, ImageSceneView, qimage_from_rgb_array
 from ..widgets.mask_editor import MaskEditorLabel
 from ..widgets.proposal_card import ProposalCard
 
@@ -614,6 +640,43 @@ class DownsamplePrepareWorker(QObject):
             self.failed.emit(f"Downsample preparation failed:\n{traceback.format_exc()}")
 
 
+class PairRegistrationWorker(QObject):
+    progress = Signal(str)
+    stage_update = Signal(object)
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, cfg: PairRegistrationConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+
+    def run(self) -> None:
+        try:
+            summary = run_pair_registration(
+                self.cfg,
+                progress_cb=self.stage_update.emit,
+            )
+            self.finished.emit(summary)
+        except Exception:
+            self.failed.emit(f"Step 5 registration failed:\n{traceback.format_exc()}")
+
+
+class ConfocalRigidWorker(QObject):
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, cfg: ConfocalRigidConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+
+    def run(self) -> None:
+        try:
+            summary = run_confocal_rigid_registration(self.cfg)
+            self.finished.emit(summary)
+        except Exception:
+            self.failed.emit(f"Step 7 confocal registration failed:\n{traceback.format_exc()}")
+
+
 class WorkflowWindow(QWidget):
     PAGE_HOME = 0
     PAGE_STAGE1 = 1
@@ -621,6 +684,8 @@ class WorkflowWindow(QWidget):
     PAGE_STAGE3 = 3
     PAGE_STAGE4 = 4
     PAGE_STAGE5 = 5
+    PAGE_STAGE6 = 6
+    PAGE_STAGE7 = 7
 
     def __init__(self, workflow_service: WorkflowService) -> None:
         super().__init__()
@@ -654,6 +719,25 @@ class WorkflowWindow(QWidget):
         self.step4_pair_cache_capacity: int = 5
         self.step5_pairs: list[WorkspacePair] = []
         self.current_step5_pair_index: int = 0
+        self.step5_run_thread: QThread | None = None
+        self.step5_run_worker = None
+        self.step6_pairs: list[WorkspacePair] = []
+        self.current_step6_pair_index: int = 0
+        self.step6_roi_root: Path | None = None
+        self.step6_current_context = None
+        self.step6_current_mapping_result: dict[str, object] | None = None
+        self.step6_preview_stale: bool = False
+        self.step6_last_updated_nissl_roi_highres: np.ndarray | None = None
+        self.step6_last_updated_myelin_roi_highres: np.ndarray | None = None
+        self.step7_myelin_root: Path | None = None
+        self.step7_sections: list[WorkspaceSection] = []
+        self.current_step7_section_index: int = 0
+        self.step7_confocal_path: Path | None = None
+        self.step7_confocal_projection_u8: np.ndarray | None = None
+        self.step7_fixed_rgb: np.ndarray | None = None
+        self.step7_fixed_labels: np.ndarray | None = None
+        self.step7_run_thread: QThread | None = None
+        self.step7_run_worker = None
         self.proposal_items: list[DraggableProposalItem] = []
         self.crop_outline_items: list[QGraphicsRectItem] = []
         self.proposal_cards: list[ProposalCard] = []
@@ -666,6 +750,7 @@ class WorkflowWindow(QWidget):
         self.predict_worker = None
         self.save_thread: QThread | None = None
         self.save_worker = None
+        self.step5_runs_root: Path | None = None
         self.bg_precompute_thread: QThread | None = None
         self.bg_precompute_worker: BackgroundPrecomputeWorker | None = None
         self.bg_precompute_generation: int = 0
@@ -680,12 +765,16 @@ class WorkflowWindow(QWidget):
         self.page_stage3 = self._build_stage3_page()
         self.page_stage4 = self._build_stage4_page()
         self.page_stage5 = self._build_stage5_page()
+        self.page_stage6 = self._build_stage6_page()
+        self.page_stage7 = self._build_stage7_page()
         self.pages.addWidget(self.page_home)
         self.pages.addWidget(self.page_stage1)
         self.pages.addWidget(self.page_stage2)
         self.pages.addWidget(self.page_stage3)
         self.pages.addWidget(self.page_stage4)
         self.pages.addWidget(self.page_stage5)
+        self.pages.addWidget(self.page_stage6)
+        self.pages.addWidget(self.page_stage7)
 
         root = QVBoxLayout()
         root.addWidget(self.pages)
@@ -706,7 +795,9 @@ class WorkflowWindow(QWidget):
             "Choose a workflow step to enter. Step 1 reviews bbox proposals and exports section crop folders. "
             "Step 2 batch-predicts masks from exported crop folders. Step 3 edits masks from those folders. "
             "Step 4 reviews paired Nissl/Myelin sections for registration readiness. "
-            "Step 5 prepares the usable reviewed pairs for downstream registration."
+            "Step 5 prepares the usable reviewed pairs for downstream registration. "
+            "Step 6 maps hand-drawn Nissl ROIs onto Myelin via an approved registration. "
+            "Step 7 aligns confocal z-stacks locally onto Myelin."
         )
         subtitle.setWordWrap(True)
 
@@ -730,6 +821,14 @@ class WorkflowWindow(QWidget):
         self.future_step5_button.setMinimumHeight(44)
         self.future_step5_button.clicked.connect(self.goto_stage5)
 
+        self.future_step6_button = QPushButton("Step 6: ROI Annotation and Mapping")
+        self.future_step6_button.setMinimumHeight(44)
+        self.future_step6_button.clicked.connect(self.goto_stage6)
+
+        self.future_step7_button = QPushButton("Step 7: Confocal to Myelin Local Registration")
+        self.future_step7_button.setMinimumHeight(44)
+        self.future_step7_button.clicked.connect(self.goto_stage7)
+
         self.home_status = QTextEdit()
         self.home_status.setReadOnly(True)
         self.home_status.setMinimumHeight(160)
@@ -742,6 +841,8 @@ class WorkflowWindow(QWidget):
                     "- Step 3: edit predicted masks from exported crop folders",
                     "- Step 4: review paired myelin/nissl sections for registration",
                     "- Step 5: inspect usable registration pairs and multi-group warnings",
+                    "- Step 6: annotate ROI on Nissl and map it to Myelin via approved registration",
+                    "- Step 7: generate confocal focus projection and rigidly align it to Myelin",
                     "",
                     "Current session:",
                     "- no slide loaded",
@@ -759,6 +860,8 @@ class WorkflowWindow(QWidget):
         layout.addWidget(self.step3_entry_button)
         layout.addWidget(self.future_step4_button)
         layout.addWidget(self.future_step5_button)
+        layout.addWidget(self.future_step6_button)
+        layout.addWidget(self.future_step7_button)
         layout.addSpacing(12)
         layout.addWidget(self.home_status)
         layout.addStretch(1)
@@ -1246,9 +1349,12 @@ class WorkflowWindow(QWidget):
         self.step5_back_button.clicked.connect(self.goto_home)
         self.step5_open_step4_button = QPushButton("Back To Step 4 QC")
         self.step5_open_step4_button.clicked.connect(self.goto_stage4)
+        self.step5_open_step6_button = QPushButton("Open Step 6 ROI Mapping")
+        self.step5_open_step6_button.clicked.connect(self.goto_stage6)
         self.step5_pair_label = QLabel("No registration pair selected")
         top.addWidget(self.step5_refresh_button)
         top.addWidget(self.step5_open_step4_button)
+        top.addWidget(self.step5_open_step6_button)
         top.addWidget(self.step5_back_button)
         top.addWidget(self.step5_pair_label)
 
@@ -1264,6 +1370,63 @@ class WorkflowWindow(QWidget):
         left.addWidget(self.step5_root_status)
 
         right = QVBoxLayout()
+        run_controls = QHBoxLayout()
+        self.step5_moving_side_combo = QComboBox()
+        self.step5_moving_side_combo.addItem("Myelin", "myelin")
+        self.step5_moving_side_combo.addItem("Nissl", "nissl")
+        self.step5_fixed_side_combo = QComboBox()
+        self.step5_fixed_side_combo.addItem("Nissl", "nissl")
+        self.step5_fixed_side_combo.addItem("Myelin", "myelin")
+        self.step5_moving_group_combo = QComboBox()
+        self.step5_fixed_group_combo = QComboBox()
+        for combo in (self.step5_moving_group_combo, self.step5_fixed_group_combo):
+            combo.addItem("All kept", "all")
+            combo.addItem("Group 1", "1")
+            combo.addItem("Group 2", "2")
+        self.step5_target_um_per_px_spin = QDoubleSpinBox()
+        self.step5_target_um_per_px_spin.setRange(4.0, 30.0)
+        self.step5_target_um_per_px_spin.setDecimals(1)
+        self.step5_target_um_per_px_spin.setSingleStep(1.0)
+        self.step5_target_um_per_px_spin.setValue(10.0)
+        self.step5_target_um_per_px_spin.setSuffix(" um/px")
+        self.step5_working_long_edge_combo = QComboBox()
+        self.step5_working_long_edge_combo.addItem("1024 (Default)", 1024)
+        self.step5_working_long_edge_combo.addItem("512 (Draft)", 512)
+        self.step5_blur_sigma_spin = QDoubleSpinBox()
+        self.step5_blur_sigma_spin.setRange(0.0, 5.0)
+        self.step5_blur_sigma_spin.setDecimals(1)
+        self.step5_blur_sigma_spin.setSingleStep(0.5)
+        self.step5_blur_sigma_spin.setValue(0.0)
+        self.step5_run_button = QPushButton("Run ANTs Registration")
+        self.step5_run_button.clicked.connect(self.run_step5_registration)
+        self.step5_approve_button = QPushButton("Approve Current Run")
+        self.step5_approve_button.clicked.connect(self.approve_current_step5_run)
+        run_controls.addWidget(QLabel("Moving"))
+        run_controls.addWidget(self.step5_moving_side_combo)
+        run_controls.addWidget(QLabel("Group"))
+        run_controls.addWidget(self.step5_moving_group_combo)
+        run_controls.addSpacing(10)
+        run_controls.addWidget(QLabel("Fixed"))
+        run_controls.addWidget(self.step5_fixed_side_combo)
+        run_controls.addWidget(QLabel("Group"))
+        run_controls.addWidget(self.step5_fixed_group_combo)
+        run_controls.addSpacing(10)
+        run_controls.addWidget(QLabel("Target"))
+        run_controls.addWidget(self.step5_target_um_per_px_spin)
+        run_controls.addWidget(QLabel("Working"))
+        run_controls.addWidget(self.step5_working_long_edge_combo)
+        run_controls.addWidget(QLabel("Blur"))
+        run_controls.addWidget(self.step5_blur_sigma_spin)
+        run_controls.addSpacing(10)
+        run_controls.addWidget(self.step5_run_button)
+        run_controls.addWidget(self.step5_approve_button)
+        right.addLayout(run_controls)
+        self.step5_progress_bar = QProgressBar()
+        self.step5_progress_bar.setRange(0, 100)
+        self.step5_progress_bar.setValue(0)
+        self.step5_progress_label = QLabel("Step 5 progress: idle")
+        right.addWidget(self.step5_progress_bar)
+        right.addWidget(self.step5_progress_label)
         right.addWidget(QLabel("Registration Entry Info"))
         self.step5_info = QTextEdit()
         self.step5_info.setReadOnly(True)
@@ -1273,14 +1436,245 @@ class WorkflowWindow(QWidget):
                     "Step 5 entry point",
                     "- only pairs marked Usable in Step 4 are shown here",
                     "- multi-group pairs mean registration should consider 1<->1 and 2<->2",
-                    "- actual registration execution is not wired yet; this page is the registry-backed entry and queue view",
+                    "- choose moving/fixed side and group, normalize both sides to a common target um/px",
+                    "- then downsample to a registration working long edge (1024 default, 512 optional) and optional blur",
+                    "- then run rigid + affine + nonlinear ANTs",
+                    "- approve a run before Step 6 can use it for ROI mapping",
                 ]
             )
         )
         right.addWidget(self.step5_info)
+        right.addWidget(QLabel("Storyboard"))
+        self.step5_storyboard_label = QLabel("No registration storyboard yet")
+        self.step5_storyboard_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.step5_storyboard_label.setMinimumSize(900, 680)
+        self.step5_storyboard_label.setStyleSheet("background:#f5f5f5; border:1px solid #cccccc;")
+        self.step5_storyboard_scroll = QScrollArea()
+        self.step5_storyboard_scroll.setWidgetResizable(True)
+        self.step5_storyboard_scroll.setWidget(self.step5_storyboard_label)
+        right.addWidget(self.step5_storyboard_scroll, 1)
 
         body.addLayout(left, 3)
-        body.addLayout(right, 4)
+        body.addLayout(right, 6)
+
+        layout.addLayout(top)
+        layout.addLayout(body)
+        page.setLayout(layout)
+        return page
+
+    def _build_stage6_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout()
+
+        top = QHBoxLayout()
+        self.step6_refresh_button = QPushButton("Refresh Approved ROI Pairs")
+        self.step6_refresh_button.clicked.connect(self.refresh_step6_pairs)
+        self.step6_back_button = QPushButton("Back To Step Menu")
+        self.step6_back_button.clicked.connect(self.goto_home)
+        self.step6_open_step5_button = QPushButton("Back To Step 5 Registration")
+        self.step6_open_step5_button.clicked.connect(self.goto_stage5)
+        self.step6_pair_label = QLabel("No approved ROI mapping pair selected")
+        top.addWidget(self.step6_refresh_button)
+        top.addWidget(self.step6_open_step5_button)
+        top.addWidget(self.step6_back_button)
+        top.addWidget(self.step6_pair_label)
+
+        body = QHBoxLayout()
+        left = QVBoxLayout()
+        left.addWidget(QLabel("Pairs With Approved Registration"))
+        self.step6_pair_list = QListWidget()
+        self.step6_pair_list.currentRowChanged.connect(self.on_step6_pair_changed)
+        left.addWidget(self.step6_pair_list)
+        self.step6_root_status = QTextEdit()
+        self.step6_root_status.setReadOnly(True)
+        self.step6_root_status.setMinimumHeight(120)
+        left.addWidget(self.step6_root_status)
+
+        center = QVBoxLayout()
+        self.step6_nissl_title = QLabel("Nissl ROI")
+        center.addWidget(self.step6_nissl_title)
+        self.step6_nissl_editor = MaskEditorLabel()
+        self.step6_nissl_editor.set_on_mask_changed(self.on_step6_roi_mask_changed)
+        self.step6_nissl_editor.set_on_save_and_next_requested(self.save_step6_roi_and_next)
+        center.addWidget(self.step6_nissl_editor, 1)
+
+        right = QVBoxLayout()
+        self.step6_mapping_status_label = QLabel("Mapped ROI preview: fresh")
+        self.step6_mapping_status_label.setStyleSheet(
+            "padding:6px 10px; border-radius:6px; background:#e8f6ec; color:#175c2b; font-weight:600;"
+        )
+        right.addWidget(self.step6_mapping_status_label)
+        controls = QHBoxLayout()
+        self.step6_update_button = QPushButton("Update ROI Mapping")
+        self.step6_update_button.clicked.connect(self.update_step6_roi_mapping_preview)
+        self.step6_save_button = QPushButton("Save ROI Outputs")
+        self.step6_save_button.clicked.connect(self.save_step6_roi)
+        self.step6_save_next_button = QPushButton("Save ROI Outputs + Move To Next")
+        self.step6_save_next_button.clicked.connect(self.save_step6_roi_and_next)
+        controls.addWidget(self.step6_update_button)
+        controls.addWidget(self.step6_save_button)
+        controls.addWidget(self.step6_save_next_button)
+        right.addLayout(controls)
+        right.addWidget(QLabel("Mapped Myelin ROI"))
+        self.step6_myelin_mapped_label = QLabel("No mapped ROI yet")
+        self.step6_myelin_mapped_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.step6_myelin_mapped_label.setMinimumSize(900, 680)
+        self.step6_myelin_mapped_label.setStyleSheet("background:#f5f5f5; border:1px solid #cccccc;")
+        self.step6_myelin_mapped_scroll = QScrollArea()
+        self.step6_myelin_mapped_scroll.setWidgetResizable(True)
+        self.step6_myelin_mapped_scroll.setWidget(self.step6_myelin_mapped_label)
+        right.addWidget(self.step6_myelin_mapped_scroll, 1)
+        self.step6_info = QTextEdit()
+        self.step6_info.setReadOnly(True)
+        self.step6_info.setPlainText(
+            "\n".join(
+                [
+                    "Step 6 ROI Annotation and Mapping",
+                    "- draw ROI on the high-resolution Nissl panel",
+                    "- Update ROI Mapping downsamples through the approved Step 5 preprocessing chain, applies the approved transform, and refreshes the high-resolution Myelin preview",
+                    "- green/yellow highlights show ROI added in the current edit batch; magenta highlights show ROI removed in the current batch",
+                    "- Save writes high-resolution ROI outputs plus low-resolution debug canvases",
+                    "- S saves and moves to the next approved pair",
+                ]
+            )
+        )
+        right.addWidget(self.step6_info)
+
+        body.addLayout(left, 3)
+        body.addLayout(center, 5)
+        body.addLayout(right, 5)
+
+        layout.addLayout(top)
+        layout.addLayout(body)
+        page.setLayout(layout)
+        return page
+
+    def _build_stage7_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout()
+
+        top = QHBoxLayout()
+        self.step7_refresh_button = QPushButton("Refresh Myelin Sections")
+        self.step7_refresh_button.clicked.connect(self.refresh_step7_sections)
+        self.step7_back_button = QPushButton("Back To Step Menu")
+        self.step7_back_button.clicked.connect(self.goto_home)
+        self.step7_pair_label = QLabel("No myelin section selected")
+        top.addWidget(self.step7_refresh_button)
+        top.addWidget(self.step7_back_button)
+        top.addWidget(self.step7_pair_label)
+
+        body = QHBoxLayout()
+        left = QVBoxLayout()
+        left.addWidget(QLabel("Myelin Sections"))
+        self.step7_section_list = QListWidget()
+        self.step7_section_list.currentRowChanged.connect(self.on_step7_section_changed)
+        left.addWidget(self.step7_section_list)
+        self.step7_root_status = QTextEdit()
+        self.step7_root_status.setReadOnly(True)
+        self.step7_root_status.setMinimumHeight(120)
+        left.addWidget(self.step7_root_status)
+
+        middle = QVBoxLayout()
+        select_row = QHBoxLayout()
+        self.step7_select_stack_button = QPushButton("Select Confocal Z-Stack")
+        self.step7_select_stack_button.clicked.connect(self.select_step7_confocal_stack)
+        self.step7_stack_label = QLabel("No confocal stack selected")
+        self.step7_stack_label.setWordWrap(True)
+        select_row.addWidget(self.step7_select_stack_button)
+        select_row.addWidget(self.step7_stack_label, 1)
+        middle.addLayout(select_row)
+
+        proj_row = QHBoxLayout()
+        self.step7_projection_mode_combo = QComboBox()
+        self.step7_projection_mode_combo.addItem("Focus / EDF", "focus")
+        self.step7_projection_mode_combo.addItem("Max", "max")
+        self.step7_projection_mode_combo.addItem("Mean", "mean")
+        self.step7_channel_spin = QSpinBox()
+        self.step7_channel_spin.setRange(0, 15)
+        self.step7_channel_spin.setValue(0)
+        self.step7_generate_projection_button = QPushButton("Generate Projection")
+        self.step7_generate_projection_button.clicked.connect(self.generate_step7_projection)
+        proj_row.addWidget(QLabel("Projection"))
+        proj_row.addWidget(self.step7_projection_mode_combo)
+        proj_row.addWidget(QLabel("Channel"))
+        proj_row.addWidget(self.step7_channel_spin)
+        proj_row.addWidget(self.step7_generate_projection_button)
+        middle.addLayout(proj_row)
+
+        manual_row = QHBoxLayout()
+        self.step7_tx_spin = QDoubleSpinBox()
+        self.step7_tx_spin.setRange(-5000.0, 5000.0)
+        self.step7_tx_spin.setDecimals(1)
+        self.step7_ty_spin = QDoubleSpinBox()
+        self.step7_ty_spin.setRange(-5000.0, 5000.0)
+        self.step7_ty_spin.setDecimals(1)
+        self.step7_angle_spin = QDoubleSpinBox()
+        self.step7_angle_spin.setRange(-180.0, 180.0)
+        self.step7_angle_spin.setDecimals(1)
+        self.step7_scale_spin = QDoubleSpinBox()
+        self.step7_scale_spin.setRange(0.1, 5.0)
+        self.step7_scale_spin.setDecimals(3)
+        self.step7_scale_spin.setValue(1.0)
+        self.step7_flip_lr_check = QCheckBox("Flip LR")
+        self.step7_flip_ud_check = QCheckBox("Flip UD")
+        self.step7_update_preview_button = QPushButton("Update Preview")
+        self.step7_update_preview_button.clicked.connect(self.update_step7_preview)
+        self.step7_run_button = QPushButton("Run Rigid Refine")
+        self.step7_run_button.clicked.connect(self.run_step7_registration)
+        manual_row.addWidget(QLabel("tx"))
+        manual_row.addWidget(self.step7_tx_spin)
+        manual_row.addWidget(QLabel("ty"))
+        manual_row.addWidget(self.step7_ty_spin)
+        manual_row.addWidget(QLabel("angle"))
+        manual_row.addWidget(self.step7_angle_spin)
+        manual_row.addWidget(QLabel("scale"))
+        manual_row.addWidget(self.step7_scale_spin)
+        manual_row.addWidget(self.step7_flip_lr_check)
+        manual_row.addWidget(self.step7_flip_ud_check)
+        manual_row.addWidget(self.step7_update_preview_button)
+        manual_row.addWidget(self.step7_run_button)
+        middle.addLayout(manual_row)
+
+        self.step7_progress_label = QLabel("Step 7 progress: idle")
+        middle.addWidget(self.step7_progress_label)
+        self.step7_info = QTextEdit()
+        self.step7_info.setReadOnly(True)
+        self.step7_info.setPlainText(
+            "\n".join(
+                [
+                    "Step 7 Confocal to Myelin Local Registration",
+                    "- select a myelin section and a confocal z-stack",
+                    "- generate a focus / EDF projection or alternative 2D projection",
+                    "- adjust tx / ty / angle / scale / flips for coarse manual alignment",
+                    "- run rigid refine to produce a local storyboard and metrics",
+                ]
+            )
+        )
+        middle.addWidget(self.step7_info)
+
+        right = QVBoxLayout()
+        right.addWidget(QLabel("Manual Preview"))
+        self.step7_preview_label = QLabel("No confocal projection preview yet")
+        self.step7_preview_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.step7_preview_label.setMinimumSize(900, 420)
+        self.step7_preview_label.setStyleSheet("background:#f5f5f5; border:1px solid #cccccc;")
+        self.step7_preview_scroll = QScrollArea()
+        self.step7_preview_scroll.setWidgetResizable(True)
+        self.step7_preview_scroll.setWidget(self.step7_preview_label)
+        right.addWidget(self.step7_preview_scroll, 1)
+        right.addWidget(QLabel("Rigid Storyboard"))
+        self.step7_storyboard_label = QLabel("No confocal rigid storyboard yet")
+        self.step7_storyboard_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.step7_storyboard_label.setMinimumSize(900, 420)
+        self.step7_storyboard_label.setStyleSheet("background:#f5f5f5; border:1px solid #cccccc;")
+        self.step7_storyboard_scroll = QScrollArea()
+        self.step7_storyboard_scroll.setWidgetResizable(True)
+        self.step7_storyboard_scroll.setWidget(self.step7_storyboard_label)
+        right.addWidget(self.step7_storyboard_scroll, 1)
+
+        body.addLayout(left, 3)
+        body.addLayout(middle, 5)
+        body.addLayout(right, 7)
 
         layout.addLayout(top)
         layout.addLayout(body)
@@ -1830,6 +2224,26 @@ class WorkflowWindow(QWidget):
             if default_nissl.exists():
                 self.step4_nissl_root = default_nissl
         self.refresh_step5_pairs()
+
+    def goto_stage6(self) -> None:
+        self.pages.setCurrentIndex(self.PAGE_STAGE6)
+        if self.step4_myelin_root is None:
+            default_myelin = self._default_step4_myelin_root()
+            if default_myelin.exists():
+                self.step4_myelin_root = default_myelin
+        if self.step4_nissl_root is None:
+            default_nissl = self._default_step4_nissl_root()
+            if default_nissl.exists():
+                self.step4_nissl_root = default_nissl
+        self.refresh_step6_pairs()
+
+    def goto_stage7(self) -> None:
+        self.pages.setCurrentIndex(self.PAGE_STAGE7)
+        if self.step7_myelin_root is None:
+            default_myelin = self._default_step4_myelin_root()
+            if default_myelin.exists():
+                self.step7_myelin_root = default_myelin
+        self.refresh_step7_sections()
 
     def _default_crop_workspace_root(self) -> Path:
         preferred = Path(r"D:\Research\Image Analysis\Nanozoomer scans")
@@ -2542,12 +2956,36 @@ class WorkflowWindow(QWidget):
         suffix = "[multi-group]" if multi_group else "[single-group]"
         return f"{pair.display_label} {suffix}"
 
+    def _step5_runs_root(self) -> Path | None:
+        self.step5_runs_root = default_pair_registration_runs_root(self.step4_myelin_root, self.step4_nissl_root)
+        return self.step5_runs_root
+
+    def _current_step5_pair(self) -> WorkspacePair | None:
+        if 0 <= self.current_step5_pair_index < len(self.step5_pairs):
+            return self.step5_pairs[self.current_step5_pair_index]
+        return None
+
+    def _set_step5_storyboard(self, storyboard_path: Path | None) -> None:
+        if storyboard_path is None or not storyboard_path.exists():
+            self.step5_storyboard_label.setText("No registration storyboard yet")
+            self.step5_storyboard_label.setPixmap(QPixmap())
+            return
+        pixmap = QPixmap(str(storyboard_path))
+        if pixmap.isNull():
+            self.step5_storyboard_label.setText(f"Failed to load storyboard:\n{storyboard_path}")
+            return
+        self.step5_storyboard_label.setText("")
+        self.step5_storyboard_label.setPixmap(pixmap)
+        self.step5_storyboard_label.resize(pixmap.size())
+
     def refresh_step5_pairs(self) -> None:
         current_key = (
             self.step5_pairs[self.current_step5_pair_index].pair_key
             if self.step5_pairs and 0 <= self.current_step5_pair_index < len(self.step5_pairs)
             else None
         )
+        runs_root = self._step5_runs_root()
+        ants_bin = find_ants_bin()
         self.step5_pair_list.clear()
         self.step5_pairs = []
         registry_path = self._step4_registry_path()
@@ -2558,11 +2996,16 @@ class WorkflowWindow(QWidget):
                     [
                         f"myelin_root: {self.step4_myelin_root or 'not set'}",
                         f"nissl_root: {self.step4_nissl_root or 'not set'}",
+                        f"registration_runs_root: {runs_root or 'not set'}",
+                        f"ants_bin: {ants_bin or 'not found'}",
                         "usable_pairs: 0",
                     ]
                 )
             )
             self.step5_pair_label.setText("No registration pair selected")
+            self.step5_progress_bar.setValue(0)
+            self.step5_progress_label.setText("Step 5 progress: idle")
+            self._set_step5_storyboard(None)
             return
         all_pairs = list_cross_stain_pairs(self.step4_myelin_root, self.step4_nissl_root)
         self.step5_pairs = [pair for pair in all_pairs if self._step4_registration_status(pair) == "usable"]
@@ -2575,6 +3018,8 @@ class WorkflowWindow(QWidget):
                     f"nissl_root: {self.step4_nissl_root}",
                     f"usable_pairs: {len(self.step5_pairs)}",
                     f"pair_registry: {registry_path if registry_path is not None else 'none'}",
+                    f"registration_runs_root: {runs_root if runs_root is not None else 'none'}",
+                    f"ants_bin: {ants_bin if ants_bin is not None else 'not found'}",
                     "only Step 4 usable pairs are shown here",
                 ]
             )
@@ -2595,6 +3040,7 @@ class WorkflowWindow(QWidget):
                     ]
                 )
             )
+            self._set_step5_storyboard(None)
 
     def on_step4_pair_changed(self, index: int) -> None:
         if index < 0 or index >= len(self.step4_pairs):
@@ -2610,6 +3056,25 @@ class WorkflowWindow(QWidget):
         review = self._step4_pair_review(pair)
         multi_group = bool(review.get("multi_group_registration"))
         reg_files = dict(review.get("registration_mask_files") or {})
+        approved = dict(review.get("approved_registration") or {})
+        latest_run = latest_registration_run_dir(self._step5_runs_root(), pair.pair_key)
+        latest_storyboard = (latest_run / "storyboard.png") if latest_run is not None else None
+        if latest_storyboard is not None and latest_storyboard.exists():
+            self._set_step5_storyboard(latest_storyboard)
+        else:
+            self._set_step5_storyboard(None)
+        self.step5_moving_side_combo.blockSignals(True)
+        self.step5_fixed_side_combo.blockSignals(True)
+        self.step5_moving_group_combo.blockSignals(True)
+        self.step5_fixed_group_combo.blockSignals(True)
+        self.step5_moving_side_combo.setCurrentIndex(max(0, self.step5_moving_side_combo.findData("myelin")))
+        self.step5_fixed_side_combo.setCurrentIndex(max(0, self.step5_fixed_side_combo.findData("nissl")))
+        self.step5_moving_group_combo.setCurrentIndex(0)
+        self.step5_fixed_group_combo.setCurrentIndex(0)
+        self.step5_moving_side_combo.blockSignals(False)
+        self.step5_fixed_side_combo.blockSignals(False)
+        self.step5_moving_group_combo.blockSignals(False)
+        self.step5_fixed_group_combo.blockSignals(False)
         self.step5_pair_label.setText(f"{index + 1}/{len(self.step5_pairs)} | {pair.display_label}")
         self.step5_info.setPlainText(
             "\n".join(
@@ -2628,14 +3093,701 @@ class WorkflowWindow(QWidget):
                     f"nissl_component_groups: {json.dumps((review.get('component_groups') or {}).get('nissl', {}), ensure_ascii=True)}",
                     f"myelin_registration_mask: {reg_files.get('myelin', 'missing')}",
                     f"nissl_registration_mask: {reg_files.get('nissl', 'missing')}",
+                    f"latest_run: {latest_run if latest_run is not None else 'none'}",
+                    f"approved_run: {approved.get('run_dir', 'none')}",
+                    f"approved_stage: {approved.get('approved_stage', 'none')}",
                     "",
                     "Registration prep notes:",
                     "- only usable pairs are shown here",
                     "- if multi_group_registration is true, run registration for 1<->1 and 2<->2 separately",
-                    "- actual registration execution is not wired yet; this page is the Step 5 entry and queue view",
+                    "- choose moving/fixed side and group, then run ANTs rigid + affine + SyN",
+                    "- storyboard updates after each stage and includes a displacement heatmap panel",
                 ]
             )
         )
+
+    def run_step5_registration(self) -> None:
+        if self.step5_run_thread is not None:
+            self.step5_info.append("Step 5 is already running a registration.")
+            return
+        pair = self._current_step5_pair()
+        if pair is None:
+            self.step5_info.append("No usable pair selected.")
+            return
+        if self.step4_myelin_root is None or self.step4_nissl_root is None:
+            QMessageBox.warning(self, "Step 5 Registration", "Myelin and Nissl roots must both be set.")
+            return
+        ants_bin = find_ants_bin()
+        if ants_bin is None:
+            QMessageBox.warning(self, "Step 5 Registration", "Could not find a local ANTs installation.")
+            return
+        runs_root = self._step5_runs_root()
+        if runs_root is None:
+            QMessageBox.warning(self, "Step 5 Registration", "Registration runs root is not available.")
+            return
+        review = self._step4_pair_review(pair)
+        moving_side = str(self.step5_moving_side_combo.currentData() or "myelin")
+        fixed_side = str(self.step5_fixed_side_combo.currentData() or "nissl")
+        moving_group = str(self.step5_moving_group_combo.currentData() or "all")
+        fixed_group = str(self.step5_fixed_group_combo.currentData() or "all")
+        if moving_side == fixed_side:
+            QMessageBox.warning(self, "Step 5 Registration", "Moving side and fixed side must be different.")
+            return
+        cfg = PairRegistrationConfig(
+            pair_key=pair.pair_key,
+            moving_side=moving_side,
+            fixed_side=fixed_side,
+            moving_group=moving_group,
+            fixed_group=fixed_group,
+            review=review,
+            common_root=runs_root.parent,
+            myelin_root=self.step4_myelin_root,
+            nissl_root=self.step4_nissl_root,
+            ants_bin=ants_bin,
+            runs_root=runs_root,
+            target_um_per_px=float(self.step5_target_um_per_px_spin.value()),
+            working_long_edge=int(self.step5_working_long_edge_combo.currentData() or 1024),
+            pre_blur_sigma=float(self.step5_blur_sigma_spin.value()),
+        )
+        self.step5_run_button.setEnabled(False)
+        self.step5_progress_bar.setValue(0)
+        self.step5_progress_label.setText("Step 5 progress: preparing registration run ...")
+        self.step5_run_thread = QThread(self)
+        self.step5_run_worker = PairRegistrationWorker(cfg)
+        self.step5_run_worker.moveToThread(self.step5_run_thread)
+        self.step5_run_thread.started.connect(self.step5_run_worker.run)
+        self.step5_run_worker.stage_update.connect(self.on_step5_registration_stage_update)
+        self.step5_run_worker.finished.connect(self.on_step5_registration_finished)
+        self.step5_run_worker.failed.connect(self.on_step5_registration_failed)
+        self.step5_run_worker.finished.connect(self.step5_run_thread.quit)
+        self.step5_run_worker.failed.connect(self.step5_run_thread.quit)
+        self.step5_run_thread.finished.connect(self.step5_run_worker.deleteLater)
+        self.step5_run_thread.finished.connect(self.step5_run_thread.deleteLater)
+        self.step5_run_thread.start()
+
+    def on_step5_registration_stage_update(self, payload: object) -> None:
+        data = dict(payload) if isinstance(payload, dict) else {}
+        stage = str(data.get("stage") or "unknown")
+        percent = max(0, min(100, int(round(float(data.get("progress_percent") or 0)))))
+        message = str(data.get("message") or stage)
+        storyboard_path = data.get("storyboard_path")
+        run_dir = data.get("run_dir")
+        self.step5_progress_bar.setValue(percent)
+        self.step5_progress_label.setText(f"Step 5 progress: {stage} | {percent}% | {message}")
+        if storyboard_path:
+            self._set_step5_storyboard(Path(str(storyboard_path)))
+        if run_dir:
+            self.step5_info.append(f"{stage}: {run_dir}")
+
+    def on_step5_registration_finished(self, summary: object) -> None:
+        data = dict(summary) if isinstance(summary, dict) else {}
+        run_dir = data.get("run_dir", "")
+        storyboard_path = data.get("storyboard_path", "")
+        if storyboard_path:
+            self._set_step5_storyboard(Path(str(storyboard_path)))
+        self.step5_progress_bar.setValue(100)
+        self.step5_progress_label.setText("Step 5 progress: registration finished")
+        self.step5_info.append(f"Registration finished. run_dir={run_dir}")
+        self.step5_run_button.setEnabled(True)
+        self.step5_run_worker = None
+        self.step5_run_thread = None
+        self._notify_completion("Step 5 registration finished")
+        self.on_step5_pair_changed(self.current_step5_pair_index)
+
+    def on_step5_registration_failed(self, message: str) -> None:
+        self.step5_info.append(message)
+        self.step5_progress_label.setText("Step 5 progress: registration failed")
+        self.step5_run_button.setEnabled(True)
+        self.step5_run_worker = None
+        self.step5_run_thread = None
+
+    def _pair_common_root(self) -> Path | None:
+        roots = [p for p in (self.step4_myelin_root, self.step4_nissl_root) if p is not None]
+        if not roots:
+            return None
+        return Path(os.path.commonpath([str(p.resolve()) for p in roots]))
+
+    def _relpath_from_common_root(self, path: Path | None) -> str | None:
+        if path is None:
+            return None
+        common_root = self._pair_common_root()
+        if common_root is None:
+            return str(path)
+        try:
+            return str(path.resolve().relative_to(common_root.resolve()))
+        except Exception:
+            return str(path)
+
+    def _latest_completed_stage_from_manifest(self, manifest: dict) -> str:
+        requested = [str(x).strip().lower() for x in manifest.get("run_stages") or [] if str(x).strip()]
+        stages = dict(manifest.get("stages") or {})
+        for stage in reversed(requested):
+            if stage in stages:
+                return stage
+        for stage in ("syn", "affine", "rigid"):
+            if stage in stages:
+                return stage
+        return "rigid"
+
+    def _set_rgb_image_label(self, label: QLabel, rgb: np.ndarray | None, empty_text: str) -> None:
+        if rgb is None:
+            label.setText(empty_text)
+            label.setPixmap(QPixmap())
+            return
+        pixmap = QPixmap.fromImage(qimage_from_rgb_array(rgb.astype(np.uint8)))
+        if pixmap.isNull():
+            label.setText(empty_text)
+            label.setPixmap(QPixmap())
+            return
+        label.setText("")
+        label.setPixmap(pixmap)
+        label.resize(pixmap.size())
+
+    @staticmethod
+    def _binary_roi_from_masks(tissue: np.ndarray, artifact: np.ndarray) -> np.ndarray:
+        return np.where(tissue > 0, 255, 0).astype(np.uint8)
+
+    @staticmethod
+    def _step6_diff_overlay_rgba(current_roi: np.ndarray, reference_roi: np.ndarray) -> np.ndarray:
+        current = np.asarray(current_roi, dtype=np.uint8) > 0
+        reference = np.asarray(reference_roi, dtype=np.uint8) > 0
+        added = current & ~reference
+        removed = reference & ~current
+        overlay = np.zeros(current.shape + (4,), dtype=np.uint8)
+        overlay[added] = np.array([160, 255, 80, 175], dtype=np.uint8)
+        overlay[removed] = np.array([255, 80, 200, 170], dtype=np.uint8)
+        return overlay
+
+    @staticmethod
+    def _step6_apply_roi_preview(rgb: np.ndarray, current_roi: np.ndarray, reference_roi: np.ndarray | None = None) -> np.ndarray:
+        overlay = rgb.copy()
+        current = np.asarray(current_roi, dtype=np.uint8) > 0
+        if np.any(current):
+            tint = np.array([80, 220, 255], dtype=np.float32)
+            overlay[current] = np.clip(0.45 * overlay[current].astype(np.float32) + 0.55 * tint, 0, 255).astype(np.uint8)
+        if reference_roi is not None:
+            reference = np.asarray(reference_roi, dtype=np.uint8) > 0
+            added = current & ~reference
+            removed = reference & ~current
+            if np.any(added):
+                tint_add = np.array([160, 255, 80], dtype=np.float32)
+                overlay[added] = np.clip(0.25 * overlay[added].astype(np.float32) + 0.75 * tint_add, 0, 255).astype(np.uint8)
+            if np.any(removed):
+                tint_remove = np.array([255, 80, 200], dtype=np.float32)
+                overlay[removed] = np.clip(0.25 * overlay[removed].astype(np.float32) + 0.75 * tint_remove, 0, 255).astype(np.uint8)
+        return overlay
+
+    def _set_step6_stale_state(self, stale: bool, *, reason: str | None = None) -> None:
+        self.step6_preview_stale = bool(stale)
+        if stale:
+            text = "Mapped ROI preview: STALE"
+            if reason:
+                text = f"{text} | {reason}"
+            self.step6_mapping_status_label.setText(text)
+            self.step6_mapping_status_label.setStyleSheet(
+                "padding:6px 10px; border-radius:6px; background:#fff1e0; color:#8a3d00; font-weight:700; border:1px solid #f1a552;"
+            )
+            self.step6_update_button.setStyleSheet(
+                "background:#f6b04d; color:#1e1e1e; font-weight:700; border:1px solid #cd8a2e; padding:4px 10px;"
+            )
+        else:
+            self.step6_mapping_status_label.setText("Mapped ROI preview: fresh")
+            self.step6_mapping_status_label.setStyleSheet(
+                "padding:6px 10px; border-radius:6px; background:#e8f6ec; color:#175c2b; font-weight:600;"
+            )
+            self.step6_update_button.setStyleSheet("")
+
+    def _current_step6_roi_highres(self) -> np.ndarray:
+        tissue, artifact = self.step6_nissl_editor.current_masks()
+        return self._binary_roi_from_masks(tissue, artifact)
+
+    def _refresh_step6_nissl_batch_overlay(self) -> None:
+        if self.step6_current_context is None:
+            self.step6_nissl_editor.set_aux_overlay_rgba(None)
+            return
+        if self.step6_last_updated_nissl_roi_highres is None:
+            self.step6_nissl_editor.set_aux_overlay_rgba(None)
+            return
+        current_roi = self._current_step6_roi_highres()
+        diff_overlay = self._step6_diff_overlay_rgba(current_roi, self.step6_last_updated_nissl_roi_highres)
+        if np.any(diff_overlay[..., 3] > 0):
+            self.step6_nissl_editor.set_aux_overlay_rgba(diff_overlay)
+        else:
+            self.step6_nissl_editor.set_aux_overlay_rgba(None)
+
+    def approve_current_step5_run(self) -> None:
+        pair = self._current_step5_pair()
+        runs_root = self._step5_runs_root()
+        registry_path = self._step4_registry_path()
+        if pair is None or runs_root is None or registry_path is None:
+            QMessageBox.warning(self, "Approve Registration Run", "A usable pair and registration roots are required.")
+            return
+        latest_run = latest_registration_run_dir(runs_root, pair.pair_key)
+        if latest_run is None:
+            QMessageBox.warning(self, "Approve Registration Run", "No registration run exists for the current pair.")
+            return
+        manifest_path = latest_run / "run_manifest.json"
+        if not manifest_path.exists():
+            QMessageBox.warning(self, "Approve Registration Run", f"Missing run manifest:\n{manifest_path}")
+            return
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        approved_stage = self._latest_completed_stage_from_manifest(manifest)
+        review = self._step4_pair_review(pair)
+        nissl_group = (
+            str(manifest.get("fixed_group") or "all")
+            if str(manifest.get("fixed_side") or "").strip().lower() == "nissl"
+            else str(manifest.get("moving_group") or "all")
+        )
+        review["approved_registration"] = {
+            "run_dir": self._relpath_from_common_root(latest_run),
+            "manifest_path": self._relpath_from_common_root(manifest_path),
+            "approved_stage": approved_stage,
+            "moving_side": str(manifest.get("moving_side") or ""),
+            "fixed_side": str(manifest.get("fixed_side") or ""),
+            "moving_group": str(manifest.get("moving_group") or "all"),
+            "fixed_group": str(manifest.get("fixed_group") or "all"),
+            "group_tag": nissl_group,
+            "approved_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        self.step4_pair_registry[pair.pair_key] = review
+        save_pair_registry(registry_path, self.step4_pair_registry)
+        self.step5_info.append(f"Approved run for downstream ROI mapping: {latest_run}")
+        self.on_step5_pair_changed(self.current_step5_pair_index)
+
+    def _step6_roi_root(self) -> Path | None:
+        self.step6_roi_root = default_pair_roi_root(self.step4_myelin_root, self.step4_nissl_root)
+        return self.step6_roi_root
+
+    def _current_step6_pair(self) -> WorkspacePair | None:
+        if 0 <= self.current_step6_pair_index < len(self.step6_pairs):
+            return self.step6_pairs[self.current_step6_pair_index]
+        return None
+
+    def _step6_pair_display_text(self, pair: WorkspacePair) -> str:
+        review = self._step4_pair_review(pair)
+        approved = dict(review.get("approved_registration") or {})
+        group_tag = str(approved.get("group_tag") or "all")
+        stage = str(approved.get("approved_stage") or "unknown")
+        return f"{pair.display_label} [approved {stage} | group {group_tag}]"
+
+    def refresh_step6_pairs(self) -> None:
+        current_key = self._current_step6_pair().pair_key if self._current_step6_pair() is not None else None
+        self.step6_pair_list.clear()
+        self.step6_pairs = []
+        registry_path = self._step4_registry_path()
+        self.step4_pair_registry = load_pair_registry(registry_path)
+        roi_root = self._step6_roi_root()
+        if self.step4_myelin_root is None or self.step4_nissl_root is None:
+            self.step6_root_status.setPlainText("Step 6 requires both myelin and nissl roots.")
+            self.step6_pair_label.setText("No approved ROI mapping pair selected")
+            self.step6_info.setPlainText("Step 6 requires Step 4/5 roots and an approved registration run.")
+            return
+        all_pairs = list_cross_stain_pairs(self.step4_myelin_root, self.step4_nissl_root)
+        self.step6_pairs = [
+            pair
+            for pair in all_pairs
+            if self._step4_registration_status(pair) == "usable"
+            and bool((self._step4_pair_review(pair).get("approved_registration") or {}))
+        ]
+        for pair in self.step6_pairs:
+            self.step6_pair_list.addItem(self._step6_pair_display_text(pair))
+        self.step6_root_status.setPlainText(
+            "\n".join(
+                [
+                    f"myelin_root: {self.step4_myelin_root}",
+                    f"nissl_root: {self.step4_nissl_root}",
+                    f"roi_root: {roi_root if roi_root is not None else 'none'}",
+                    f"approved_pairs: {len(self.step6_pairs)}",
+                    "only usable pairs with an approved Step 5 run are shown here",
+                ]
+            )
+        )
+        if self.step6_pairs:
+            matched_idx = next((i for i, pair in enumerate(self.step6_pairs) if pair.pair_key == current_key), None)
+            self.current_step6_pair_index = matched_idx if matched_idx is not None else min(self.current_step6_pair_index, len(self.step6_pairs) - 1)
+            self.step6_pair_list.setCurrentRow(self.current_step6_pair_index)
+            self.on_step6_pair_changed(self.current_step6_pair_index)
+        else:
+            self.current_step6_pair_index = 0
+            self.step6_current_context = None
+            self.step6_current_mapping_result = None
+            self.step6_last_updated_nissl_roi_highres = None
+            self.step6_last_updated_myelin_roi_highres = None
+            self.step6_pair_label.setText("No approved ROI mapping pair selected")
+            self.step6_nissl_editor.set_section(np.full((32, 32, 3), 255, dtype=np.uint8), np.zeros((32, 32), dtype=np.uint8), np.zeros((32, 32), dtype=np.uint8))
+            self.step6_nissl_editor.set_aux_overlay_rgba(None)
+            self._set_rgb_image_label(self.step6_myelin_mapped_label, None, "No mapped ROI yet")
+            self.step6_info.setPlainText("No usable pair currently has an approved Step 5 registration.")
+            self._set_step6_stale_state(False)
+
+    def on_step6_pair_changed(self, index: int) -> None:
+        if index < 0 or index >= len(self.step6_pairs):
+            return
+        self.current_step6_pair_index = index
+        pair = self.step6_pairs[index]
+        review = self._step4_pair_review(pair)
+        common_root = self._pair_common_root()
+        roi_root = self._step6_roi_root()
+        if common_root is None or roi_root is None:
+            return
+        context = load_approved_registration_context(
+            pair.pair_key,
+            review,
+            common_root,
+            roi_root,
+            self.step4_myelin_root,
+            self.step4_nissl_root,
+        )
+        self.step6_current_context = context
+        self.step6_current_mapping_result = None
+        if context is None:
+            self.step6_last_updated_nissl_roi_highres = None
+            self.step6_last_updated_myelin_roi_highres = None
+            self.step6_pair_label.setText(f"{index + 1}/{len(self.step6_pairs)} | {pair.display_label}")
+            self.step6_nissl_editor.set_section(np.full((32, 32, 3), 255, dtype=np.uint8), np.zeros((32, 32), dtype=np.uint8), np.zeros((32, 32), dtype=np.uint8))
+            self.step6_nissl_editor.set_aux_overlay_rgba(None)
+            self.step6_info.setPlainText("Approved registration metadata is missing or points to files that no longer exist.")
+            self._set_rgb_image_label(self.step6_myelin_mapped_label, None, "No mapped ROI yet")
+            self._set_step6_stale_state(False)
+            return
+        state = current_step6_state(context)
+        self.step6_last_updated_nissl_roi_highres = np.asarray(state["nissl_roi"], dtype=np.uint8).copy()
+        self.step6_last_updated_myelin_roi_highres = np.asarray(state["myelin_roi"], dtype=np.uint8).copy()
+        self.step6_nissl_editor.set_section(
+            state["nissl_rgb"],
+            state["nissl_roi"],
+            np.zeros(state["nissl_roi"].shape, dtype=np.uint8),
+        )
+        self.step6_nissl_editor.set_active_layer("tissue")
+        self.step6_nissl_editor.set_aux_overlay_rgba(None)
+        self._set_rgb_image_label(self.step6_myelin_mapped_label, state["myelin_overlay"], "No mapped ROI yet")
+        self.step6_nissl_title.setText(f"Nissl ROI | {pair.nissl_item.label}")
+        self.step6_pair_label.setText(f"{index + 1}/{len(self.step6_pairs)} | {pair.display_label}")
+        self._set_step6_stale_state(False)
+        approved = dict(review.get("approved_registration") or {})
+        self.step6_info.setPlainText(
+            "\n".join(
+                [
+                    f"pair_key: {pair.pair_key}",
+                    f"approved_run_dir: {approved.get('run_dir', 'missing')}",
+                    f"approved_stage: {approved.get('approved_stage', 'unknown')}",
+                    f"group_tag: {approved.get('group_tag', 'all')}",
+                    f"roi_output_dir: {context.output_dir}",
+                    "",
+                    "Editing:",
+                    "- draw ROI on the high-resolution Nissl side",
+                    "- tissue brush is the intended ROI layer; artifact is ignored on update/save",
+                    "- Update ROI Mapping applies the approved run without re-optimizing ANTs",
+                    "- green/yellow = current batch added ROI, magenta = current batch removed ROI",
+                    "- Save writes the current high-resolution ROI and mapped Myelin ROI",
+                    "- S saves and advances to the next approved pair",
+                ]
+            )
+        )
+
+    def update_step6_roi_mapping_preview(self) -> bool:
+        context = self.step6_current_context
+        ants_bin = find_ants_bin()
+        if context is None:
+            return False
+        if ants_bin is None:
+            QMessageBox.warning(self, "Step 6 ROI Mapping", "Could not find a local ANTs installation.")
+            return False
+        roi_labels_highres = self._current_step6_roi_highres()
+        previous_myelin_roi = (
+            self.step6_last_updated_myelin_roi_highres.copy()
+            if self.step6_last_updated_myelin_roi_highres is not None
+            else None
+        )
+        result = update_step6_roi_mapping(context, roi_labels_highres, ants_bin)
+        self.step6_current_mapping_result = result
+        state = current_step6_state(context)
+        mapped = np.asarray(result["myelin_roi_highres"], dtype=np.uint8)
+        myelin_overlay = self._step6_apply_roi_preview(state["myelin_rgb"], mapped, previous_myelin_roi)
+        self._set_rgb_image_label(self.step6_myelin_mapped_label, myelin_overlay, "No mapped ROI yet")
+        self.step6_last_updated_nissl_roi_highres = roi_labels_highres.copy()
+        self.step6_last_updated_myelin_roi_highres = mapped.copy()
+        self.step6_nissl_editor.set_aux_overlay_rgba(None)
+        self._set_step6_stale_state(False)
+        self.step6_info.append(
+            "Updated ROI mapping preview using the approved Step 5 transform. "
+            "Green/yellow shows newly added ROI in this batch; magenta shows removed ROI."
+        )
+        return True
+
+    def on_step6_roi_mask_changed(self) -> None:
+        if self.step6_current_context is None:
+            return
+        self.step6_current_mapping_result = None
+        self._refresh_step6_nissl_batch_overlay()
+        already_stale = self.step6_preview_stale
+        self._set_step6_stale_state(True, reason="left ROI changed; right preview is out of date")
+        if not already_stale:
+            self.step6_info.append(
+                "ROI changed: preview mapping is now stale. "
+                "Green/yellow marks added ROI in the current edit batch; magenta marks removed ROI. "
+                "Click Update ROI Mapping to refresh the Myelin overlay."
+            )
+
+    def save_step6_roi(self) -> bool:
+        pair = self._current_step6_pair()
+        context = self.step6_current_context
+        if pair is None or context is None:
+            return False
+        if self.step6_current_mapping_result is None:
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Icon.Warning)
+            msg.setWindowTitle("Step 6 ROI Mapping")
+            msg.setText("Mapped Myelin preview is stale.")
+            msg.setInformativeText("Update ROI Mapping before saving so the right-side ROI matches the latest left-side edits.")
+            update_button = msg.addButton("Update Mapping", QMessageBox.ButtonRole.AcceptRole)
+            cancel_button = msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            msg.setDefaultButton(update_button)
+            msg.exec()
+            if msg.clickedButton() is not update_button:
+                return False
+            if not self.update_step6_roi_mapping_preview():
+                return False
+        result = save_step6_roi_outputs(context, self.step6_current_mapping_result or {})
+        state = current_step6_state(context)
+        self._set_rgb_image_label(self.step6_myelin_mapped_label, state["myelin_overlay"], "No mapped ROI yet")
+        self.step6_last_updated_nissl_roi_highres = np.asarray(state["nissl_roi"], dtype=np.uint8).copy()
+        self.step6_last_updated_myelin_roi_highres = np.asarray(state["myelin_roi"], dtype=np.uint8).copy()
+        self.step6_nissl_editor.set_aux_overlay_rgba(None)
+        self._set_step6_stale_state(False)
+        registry_path = self._step4_registry_path()
+        if registry_path is not None:
+            review = self._step4_pair_review(pair)
+            review["roi_mapping"] = {
+                "output_dir": self._relpath_from_common_root(context.output_dir),
+                "manifest_path": self._relpath_from_common_root(context.output_dir / "roi_manifest.json"),
+                "saved_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+            self.step4_pair_registry[pair.pair_key] = review
+            save_pair_registry(registry_path, self.step4_pair_registry)
+        self.step6_current_mapping_result = None
+        self.step6_info.append(f"Saved ROI outputs: {context.output_dir}")
+        return True
+
+    def save_step6_roi_and_next(self) -> None:
+        old_index = self.current_step6_pair_index
+        if not self.save_step6_roi():
+            return
+        if not self.step6_pairs:
+            return
+        target_index = min(old_index + 1, len(self.step6_pairs) - 1)
+        self.current_step6_pair_index = target_index
+        if self.step6_pair_list.currentRow() != target_index:
+            self.step6_pair_list.setCurrentRow(target_index)
+        self.on_step6_pair_changed(target_index)
+
+    def _step7_runs_root(self) -> Path | None:
+        return default_confocal_registration_root(self.step7_myelin_root)
+
+    def _current_step7_item(self) -> WorkspaceSection | None:
+        if 0 <= self.current_step7_section_index < len(self.step7_sections):
+            return self.step7_sections[self.current_step7_section_index]
+        return None
+
+    def refresh_step7_sections(self) -> None:
+        if self.step7_myelin_root is None:
+            self.step7_myelin_root = self._default_step4_myelin_root()
+        current_label = self._current_step7_item().label if self._current_step7_item() is not None else None
+        self.step7_section_list.clear()
+        if self.step7_myelin_root is None or not self.step7_myelin_root.exists():
+            self.step7_sections = []
+            self.step7_root_status.setPlainText("Step 7 myelin root is not set.")
+            return
+        self.step7_sections = [
+            item
+            for item in list_workspace_sections(self.step7_myelin_root)
+            if item.stain in {"gallyas", "myelin", ""}
+        ]
+        for item in self.step7_sections:
+            self.step7_section_list.addItem(item.label)
+        self.step7_root_status.setPlainText(
+            "\n".join(
+                [
+                    f"myelin_root: {self.step7_myelin_root}",
+                    f"confocal_runs_root: {self._step7_runs_root()}",
+                    f"myelin_sections: {len(self.step7_sections)}",
+                ]
+            )
+        )
+        if self.step7_sections:
+            matched_idx = next((i for i, item in enumerate(self.step7_sections) if item.label == current_label), None)
+            self.current_step7_section_index = matched_idx if matched_idx is not None else min(self.current_step7_section_index, len(self.step7_sections) - 1)
+            self.step7_section_list.setCurrentRow(self.current_step7_section_index)
+            self.on_step7_section_changed(self.current_step7_section_index)
+
+    def on_step7_section_changed(self, index: int) -> None:
+        if index < 0 or index >= len(self.step7_sections):
+            return
+        self.current_step7_section_index = index
+        item = self.step7_sections[index]
+        fixed_rgb, fixed_labels = prepare_myelin_confocal_fixed(item)
+        self.step7_fixed_rgb = fixed_rgb
+        self.step7_fixed_labels = fixed_labels
+        self.step7_pair_label.setText(f"{index + 1}/{len(self.step7_sections)} | {item.label}")
+        self.step7_storyboard_label.setText("No confocal rigid storyboard yet")
+        self.step7_storyboard_label.setPixmap(QPixmap())
+        self.step7_info.setPlainText(
+            "\n".join(
+                [
+                    f"myelin_label: {item.label}",
+                    f"section_dir: {item.section_dir}",
+                    f"confocal_stack: {self.step7_confocal_path if self.step7_confocal_path is not None else 'none'}",
+                    "",
+                    "Workflow:",
+                    "- select a confocal z-stack",
+                    "- generate a 2D projection",
+                    "- adjust manual coarse alignment",
+                    "- run rigid refine",
+                ]
+            )
+        )
+        self.update_step7_preview()
+
+    def select_step7_confocal_stack(self) -> None:
+        default_dir = str(self.step7_myelin_root if self.step7_myelin_root is not None else self._default_crop_workspace_root())
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Confocal Z-Stack",
+            default_dir,
+            "TIFF stacks (*.tif *.tiff);;All Files (*)",
+        )
+        if not file_path:
+            return
+        self.step7_confocal_path = Path(file_path)
+        self.step7_confocal_projection_u8 = None
+        self.step7_stack_label.setText(str(self.step7_confocal_path))
+        self.step7_storyboard_label.setText("No confocal rigid storyboard yet")
+        self.step7_storyboard_label.setPixmap(QPixmap())
+        self.step7_preview_label.setText("Generate a projection to preview coarse alignment.")
+        self.step7_preview_label.setPixmap(QPixmap())
+
+    def generate_step7_projection(self) -> None:
+        if self.step7_confocal_path is None:
+            QMessageBox.warning(self, "Step 7 Confocal", "Select a confocal z-stack first.")
+            return
+        try:
+            import tifffile
+        except Exception as exc:
+            QMessageBox.warning(self, "Step 7 Confocal", f"tifffile is required:\n{exc}")
+            return
+        stack = np.asarray(tifffile.imread(str(self.step7_confocal_path)))
+        channel_count = infer_stack_channel_count(stack)
+        self.step7_channel_spin.setMaximum(max(0, channel_count - 1))
+        channel_index = int(self.step7_channel_spin.value())
+        mode = str(self.step7_projection_mode_combo.currentData() or "focus")
+        self.step7_confocal_projection_u8 = project_confocal_stack(stack, mode=mode, channel_index=channel_index)
+        self.step7_info.append(
+            f"Generated confocal projection: mode={mode} channel={channel_index} shape={self.step7_confocal_projection_u8.shape}"
+        )
+        self.update_step7_preview()
+
+    def update_step7_preview(self) -> None:
+        if self.step7_fixed_rgb is None or self.step7_fixed_labels is None:
+            self._set_rgb_image_label(self.step7_preview_label, None, "No myelin section selected")
+            return
+        if self.step7_confocal_projection_u8 is None:
+            self._set_rgb_image_label(self.step7_preview_label, self.step7_fixed_rgb, "No confocal projection preview yet")
+            return
+        warped, _warped_mask, _mat = apply_manual_transform(
+            self.step7_confocal_projection_u8,
+            self.step7_fixed_rgb.shape[:2],
+            tx_px=float(self.step7_tx_spin.value()),
+            ty_px=float(self.step7_ty_spin.value()),
+            angle_deg=float(self.step7_angle_spin.value()),
+            scale=float(self.step7_scale_spin.value()),
+            flip_lr=bool(self.step7_flip_lr_check.isChecked()),
+            flip_ud=bool(self.step7_flip_ud_check.isChecked()),
+        )
+        fixed_gray_u8 = cv2.cvtColor(self.step7_fixed_rgb, cv2.COLOR_RGB2GRAY)
+        base = cv2.cvtColor(fixed_gray_u8, cv2.COLOR_GRAY2RGB)
+        preview = base.copy()
+        confocal_rgb = cv2.cvtColor(warped, cv2.COLOR_GRAY2RGB)
+        mask = warped > 0
+        if np.any(mask):
+            preview[mask] = np.clip(
+                0.55 * preview[mask].astype(np.float32) + 0.45 * confocal_rgb[mask].astype(np.float32),
+                0,
+                255,
+            ).astype(np.uint8)
+        self._set_rgb_image_label(self.step7_preview_label, preview, "No confocal projection preview yet")
+
+    def run_step7_registration(self) -> None:
+        if self.step7_run_thread is not None:
+            self.step7_info.append("Step 7 is already running a confocal registration.")
+            return
+        item = self._current_step7_item()
+        runs_root = self._step7_runs_root()
+        ants_bin = find_ants_bin()
+        if item is None or self.step7_fixed_rgb is None or self.step7_fixed_labels is None:
+            QMessageBox.warning(self, "Step 7 Confocal", "Select a myelin section first.")
+            return
+        if self.step7_confocal_projection_u8 is None or self.step7_confocal_path is None:
+            QMessageBox.warning(self, "Step 7 Confocal", "Generate a confocal projection first.")
+            return
+        if runs_root is None:
+            QMessageBox.warning(self, "Step 7 Confocal", "Confocal registration output root is not available.")
+            return
+        if ants_bin is None:
+            QMessageBox.warning(self, "Step 7 Confocal", "Could not find a local ANTs installation.")
+            return
+        cfg = ConfocalRigidConfig(
+            myelin_label=item.label,
+            myelin_rgb=self.step7_fixed_rgb,
+            myelin_labels=self.step7_fixed_labels,
+            confocal_projection_u8=self.step7_confocal_projection_u8,
+            ants_bin=ants_bin,
+            out_root=runs_root,
+            confocal_source=self.step7_confocal_path,
+            projection_mode=str(self.step7_projection_mode_combo.currentData() or "focus"),
+            channel_index=int(self.step7_channel_spin.value()),
+            tx_px=float(self.step7_tx_spin.value()),
+            ty_px=float(self.step7_ty_spin.value()),
+            angle_deg=float(self.step7_angle_spin.value()),
+            scale=float(self.step7_scale_spin.value()),
+            flip_lr=bool(self.step7_flip_lr_check.isChecked()),
+            flip_ud=bool(self.step7_flip_ud_check.isChecked()),
+        )
+        self.step7_run_button.setEnabled(False)
+        self.step7_progress_label.setText("Step 7 progress: running rigid refine ...")
+        self.step7_run_thread = QThread(self)
+        self.step7_run_worker = ConfocalRigidWorker(cfg)
+        self.step7_run_worker.moveToThread(self.step7_run_thread)
+        self.step7_run_thread.started.connect(self.step7_run_worker.run)
+        self.step7_run_worker.finished.connect(self.on_step7_registration_finished)
+        self.step7_run_worker.failed.connect(self.on_step7_registration_failed)
+        self.step7_run_worker.finished.connect(self.step7_run_thread.quit)
+        self.step7_run_worker.failed.connect(self.step7_run_thread.quit)
+        self.step7_run_thread.finished.connect(self.step7_run_worker.deleteLater)
+        self.step7_run_thread.finished.connect(self.step7_run_thread.deleteLater)
+        self.step7_run_thread.start()
+
+    def on_step7_registration_finished(self, summary: object) -> None:
+        data = dict(summary) if isinstance(summary, dict) else {}
+        storyboard = Path(str(data.get("storyboard_path", ""))) if data.get("storyboard_path") else None
+        self.step7_progress_label.setText("Step 7 progress: rigid refine finished")
+        self.step7_run_button.setEnabled(True)
+        self.step7_run_worker = None
+        self.step7_run_thread = None
+        self.step7_info.append(f"Rigid refine finished. run_dir={data.get('run_dir', '')}")
+        if storyboard is not None and storyboard.exists():
+            pixmap = QPixmap(str(storyboard))
+            if not pixmap.isNull():
+                self.step7_storyboard_label.setText("")
+                self.step7_storyboard_label.setPixmap(pixmap)
+                self.step7_storyboard_label.resize(pixmap.size())
+        self._notify_completion("Step 7 confocal rigid registration finished")
+
+    def on_step7_registration_failed(self, message: str) -> None:
+        self.step7_info.append(message)
+        self.step7_progress_label.setText("Step 7 progress: registration failed")
+        self.step7_run_button.setEnabled(True)
+        self.step7_run_worker = None
+        self.step7_run_thread = None
 
     def _ensure_step4_review_status_selected(self) -> bool:
         status = str(self.step4_registration_status_combo.currentData() or "unreviewed")

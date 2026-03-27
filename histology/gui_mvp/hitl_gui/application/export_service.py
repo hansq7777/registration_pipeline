@@ -6,6 +6,7 @@ import os
 import queue
 import subprocess
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from functools import lru_cache
 
@@ -386,6 +387,22 @@ class ExportWorker(QObject):
                 "x_um_per_px": float(scale_x * self.loaded_slide.mpp_x),
                 "y_um_per_px": float(scale_y * self.loaded_slide.mpp_y),
             }
+        metadata["physical_provenance"] = {
+            "version": "physical_provenance_v1",
+            "recovered_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "recovery_method": "step1_export",
+            "slide_resolution_method": "export_loaded_slide",
+            "mpp_recovery_method": "slide_header" if self.loaded_slide.mpp_x is not None and self.loaded_slide.mpp_y is not None else "unavailable",
+            "source_slide_identity": metadata["source_slide_identity"],
+            "source_slide": metadata["source_slide"],
+            "proposal_bbox_overview_xywh": metadata["proposal_bbox_overview_xywh"],
+            "crop_bbox_level0": metadata["crop_bbox_level0"],
+            "export_canvas": metadata["export_canvas"],
+            "canvas_to_slide_level0": metadata["canvas_to_slide_level0"],
+            "crop_bbox_level0_um_relative_to_slide_origin": metadata.get("crop_bbox_level0_um_relative_to_slide_origin"),
+            "canvas_to_slide_um_per_px": metadata.get("canvas_to_slide_um_per_px"),
+            "physical_calibration_available": bool(self.loaded_slide.mpp_x is not None and self.loaded_slide.mpp_y is not None),
+        }
         return metadata
 
     def request_cancel(self) -> None:
