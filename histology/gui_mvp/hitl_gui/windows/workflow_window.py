@@ -76,11 +76,15 @@ from ..application.roi_mapping import (
 )
 from ..application.confocal_registration import (
     ConfocalRigidConfig,
-    apply_manual_transform,
+    STEP7_REGISTRATION_INPUT_PROFILE,
+    STEP7_TARGET_UM_PER_PX,
+    _invert_confocal_u8,
+    _resample_mask_to_target_um_per_px,
     default_confocal_registration_root,
-    infer_stack_channel_count,
-    prepare_myelin_confocal_fixed,
-    project_confocal_stack,
+    export_confocal_full_report,
+    load_confocal_projection,
+    prepare_myelin_confocal_fixed_bundle,
+    _resample_projection_to_target_um_per_px,
     run_confocal_rigid_registration,
 )
 from ..db import connect_db, transaction
@@ -102,7 +106,7 @@ from ..pipeline_adapters import (
 )
 from ..pipeline_adapters.slide_io import effective_crop_rect_overview, open_slide_handle
 from ..repositories import RevisionRepository, SectionRepository
-from ..widgets.graphics import DraggableProposalItem, ImageSceneView, qimage_from_rgb_array
+from ..widgets.graphics import ConfocalAlignmentView, DraggableProposalItem, ImageSceneView, qimage_from_rgb_array
 from ..widgets.mask_editor import MaskEditorLabel
 from ..widgets.proposal_card import ProposalCard
 
@@ -159,6 +163,70 @@ else:
 
     def _play_attention_sound() -> None:
         return None
+
+
+def _fit_step7_procrustes(src_xy: np.ndarray, dst_xy: np.ndarray, *, allow_scale: bool) -> dict[str, object]:
+    src = np.asarray(src_xy, dtype=np.float64)
+    dst = np.asarray(dst_xy, dtype=np.float64)
+    src_ctr = src.mean(axis=0)
+    dst_ctr = dst.mean(axis=0)
+    src_c = src - src_ctr
+    dst_c = dst - dst_ctr
+    cov = src_c.T @ dst_c
+    u, s, vt = np.linalg.svd(cov)
+    rot = vt.T @ u.T
+    if np.linalg.det(rot) < 0:
+        vt[-1, :] *= -1.0
+        rot = vt.T @ u.T
+    scale = 1.0
+    if allow_scale:
+        denom = float(np.sum(src_c**2))
+        if denom > 1e-8:
+            scale = float(np.sum(s) / denom)
+    pred = (scale * (src @ rot.T)) + (dst_ctr - scale * (src_ctr @ rot.T))
+    residual_vec = pred - dst
+    residual_norm = np.linalg.norm(residual_vec, axis=1)
+    translation = dst_ctr - scale * (src_ctr @ rot.T)
+    return {
+        "scale": float(scale),
+        "rotation_matrix": rot.astype(float).tolist(),
+        "rotation_deg": float(np.degrees(np.arctan2(rot[1, 0], rot[0, 0]))),
+        "translation_xy": translation.astype(float).tolist(),
+        "pred_xy": pred.astype(float).tolist(),
+        "residual_xy": residual_vec.astype(float).tolist(),
+        "residual_norm": residual_norm.astype(float).tolist(),
+        "rms_px": float(np.sqrt(np.mean(residual_norm**2))) if residual_norm.size else float("nan"),
+        "mean_px": float(np.mean(residual_norm)) if residual_norm.size else float("nan"),
+        "max_px": float(np.max(residual_norm)) if residual_norm.size else float("nan"),
+    }
+
+
+def _fit_step7_affine(src_xy: np.ndarray, dst_xy: np.ndarray) -> dict[str, object]:
+    src = np.asarray(src_xy, dtype=np.float64)
+    dst = np.asarray(dst_xy, dtype=np.float64)
+    src_aug = np.concatenate([src, np.ones((src.shape[0], 1), dtype=np.float64)], axis=1)
+    coeff, _, _, _ = np.linalg.lstsq(src_aug, dst, rcond=None)
+    pred = src_aug @ coeff
+    residual_vec = pred - dst
+    residual_norm = np.linalg.norm(residual_vec, axis=1)
+    mat = coeff.T
+    linear = mat[:, :2]
+    col0 = linear[:, 0]
+    col1 = linear[:, 1]
+    scale_x = float(np.linalg.norm(col0))
+    shear = float(np.dot(col0 / max(scale_x, 1e-8), col1)) if scale_x > 1e-8 else 0.0
+    return {
+        "matrix_2x3": mat.astype(float).tolist(),
+        "pred_xy": pred.astype(float).tolist(),
+        "residual_xy": residual_vec.astype(float).tolist(),
+        "residual_norm": residual_norm.astype(float).tolist(),
+        "rms_px": float(np.sqrt(np.mean(residual_norm**2))) if residual_norm.size else float("nan"),
+        "mean_px": float(np.mean(residual_norm)) if residual_norm.size else float("nan"),
+        "max_px": float(np.max(residual_norm)) if residual_norm.size else float("nan"),
+        "scale_x_like": scale_x,
+        "scale_y_like": float(np.linalg.norm(col1)),
+        "shear_like": shear,
+    }
 
 
 class SaveRevisionWorker(QObject):
@@ -732,12 +800,23 @@ class WorkflowWindow(QWidget):
         self.step7_myelin_root: Path | None = None
         self.step7_sections: list[WorkspaceSection] = []
         self.current_step7_section_index: int = 0
-        self.step7_confocal_path: Path | None = None
+        self.step7_confocal_paths: list[Path] = []
+        self.step7_confocal_source_mode: str = "none"
+        self.step7_projection_info: dict[str, object] | None = None
+        self.step7_confocal_projection_raw_u8: np.ndarray | None = None
         self.step7_confocal_projection_u8: np.ndarray | None = None
+        self.step7_confocal_projection_mask_raw_u8: np.ndarray | None = None
+        self.step7_confocal_projection_mask_u8: np.ndarray | None = None
         self.step7_fixed_rgb: np.ndarray | None = None
         self.step7_fixed_labels: np.ndarray | None = None
+        self.step7_fixed_info: dict[str, object] | None = None
+        self.step7_fixed_cache: dict[str, tuple[np.ndarray, np.ndarray, dict[str, object]]] = {}
         self.step7_run_thread: QThread | None = None
         self.step7_run_worker = None
+        self.step7_last_manual_action: str | None = None
+        self.step7_last_run_dir: Path | None = None
+        self.step7_diagnostic_log: list[str] = []
+        self.step7_last_run_summary_lines: list[str] = []
         self.proposal_items: list[DraggableProposalItem] = []
         self.crop_outline_items: list[QGraphicsRectItem] = []
         self.proposal_cards: list[ProposalCard] = []
@@ -1425,8 +1504,16 @@ class WorkflowWindow(QWidget):
         self.step5_progress_bar.setRange(0, 100)
         self.step5_progress_bar.setValue(0)
         self.step5_progress_label = QLabel("Step 5 progress: idle")
+        self.step5_acceptance_label = QLabel(
+            "Accepted path: input | Rejected: none | Best accepted state runner: downstream stages start from the current best state."
+        )
+        self.step5_acceptance_label.setWordWrap(True)
+        self.step5_acceptance_label.setStyleSheet(
+            "padding:6px 10px; border-radius:6px; background:#eef4fb; color:#24405c; border:1px solid #c9d8ea; font-weight:600;"
+        )
         right.addWidget(self.step5_progress_bar)
         right.addWidget(self.step5_progress_label)
+        right.addWidget(self.step5_acceptance_label)
         right.addWidget(QLabel("Registration Entry Info"))
         self.step5_info = QTextEdit()
         self.step5_info.setReadOnly(True)
@@ -1439,6 +1526,7 @@ class WorkflowWindow(QWidget):
                     "- choose moving/fixed side and group, normalize both sides to a common target um/px",
                     "- then downsample to a registration working long edge (1024 default, 512 optional) and optional blur",
                     "- then run rigid + affine + nonlinear ANTs",
+                    "- later stages start from the current best accepted state, not a rejected linear result",
                     "- approve a run before Step 6 can use it for ROI mapping",
                 ]
             )
@@ -1565,7 +1653,7 @@ class WorkflowWindow(QWidget):
 
         body = QHBoxLayout()
         left = QVBoxLayout()
-        left.addWidget(QLabel("Myelin Sections"))
+        left.addWidget(QLabel("Section Selection"))
         self.step7_section_list = QListWidget()
         self.step7_section_list.currentRowChanged.connect(self.on_step7_section_changed)
         left.addWidget(self.step7_section_list)
@@ -1576,9 +1664,9 @@ class WorkflowWindow(QWidget):
 
         middle = QVBoxLayout()
         select_row = QHBoxLayout()
-        self.step7_select_stack_button = QPushButton("Select Confocal Z-Stack")
+        self.step7_select_stack_button = QPushButton("Select Confocal Source(s)")
         self.step7_select_stack_button.clicked.connect(self.select_step7_confocal_stack)
-        self.step7_stack_label = QLabel("No confocal stack selected")
+        self.step7_stack_label = QLabel("No confocal source selected")
         self.step7_stack_label.setWordWrap(True)
         select_row.addWidget(self.step7_select_stack_button)
         select_row.addWidget(self.step7_stack_label, 1)
@@ -1592,14 +1680,26 @@ class WorkflowWindow(QWidget):
         self.step7_channel_spin = QSpinBox()
         self.step7_channel_spin.setRange(0, 15)
         self.step7_channel_spin.setValue(0)
+        self.step7_overlap_spin = QDoubleSpinBox()
+        self.step7_overlap_spin.setRange(0.0, 0.45)
+        self.step7_overlap_spin.setDecimals(3)
+        self.step7_overlap_spin.setSingleStep(0.01)
+        self.step7_overlap_spin.setValue(0.10)
         self.step7_generate_projection_button = QPushButton("Generate Projection")
         self.step7_generate_projection_button.clicked.connect(self.generate_step7_projection)
         proj_row.addWidget(QLabel("Projection"))
         proj_row.addWidget(self.step7_projection_mode_combo)
-        proj_row.addWidget(QLabel("Channel"))
-        proj_row.addWidget(self.step7_channel_spin)
         proj_row.addWidget(self.step7_generate_projection_button)
+        proj_row.addStretch(1)
         middle.addLayout(proj_row)
+
+        tile_row = QHBoxLayout()
+        self.step7_show_tile_outline_check = QCheckBox("Show Tile Grid Helper")
+        self.step7_show_tile_outline_check.setChecked(False)
+        self.step7_show_tile_outline_check.toggled.connect(self.update_step7_tile_outline_preview)
+        tile_row.addWidget(self.step7_show_tile_outline_check)
+        tile_row.addStretch(1)
+        middle.addLayout(tile_row)
 
         manual_row = QHBoxLayout()
         self.step7_tx_spin = QDoubleSpinBox()
@@ -1615,24 +1715,27 @@ class WorkflowWindow(QWidget):
         self.step7_scale_spin.setRange(0.1, 5.0)
         self.step7_scale_spin.setDecimals(3)
         self.step7_scale_spin.setValue(1.0)
+        self.step7_refine_model_combo = QComboBox()
+        self.step7_refine_model_combo.addItem("Similarity (Default)", "similarity")
+        self.step7_refine_model_combo.addItem("Affine", "affine")
         self.step7_flip_lr_check = QCheckBox("Flip LR")
         self.step7_flip_ud_check = QCheckBox("Flip UD")
+        self.step7_flip_lr_check.setChecked(False)
+        self.step7_flip_ud_check.setChecked(True)
+        self.step7_flip_lr_check.setEnabled(False)
+        self.step7_flip_ud_check.setEnabled(False)
+        self.step7_flip_lr_check.toggled.connect(self.on_step7_flip_changed)
+        self.step7_flip_ud_check.toggled.connect(self.on_step7_flip_changed)
         self.step7_update_preview_button = QPushButton("Update Preview")
         self.step7_update_preview_button.clicked.connect(self.update_step7_preview)
-        self.step7_run_button = QPushButton("Run Rigid Refine")
+        self.step7_run_button = QPushButton("Fiber Registration")
         self.step7_run_button.clicked.connect(self.run_step7_registration)
-        manual_row.addWidget(QLabel("tx"))
-        manual_row.addWidget(self.step7_tx_spin)
-        manual_row.addWidget(QLabel("ty"))
-        manual_row.addWidget(self.step7_ty_spin)
-        manual_row.addWidget(QLabel("angle"))
-        manual_row.addWidget(self.step7_angle_spin)
-        manual_row.addWidget(QLabel("scale"))
-        manual_row.addWidget(self.step7_scale_spin)
-        manual_row.addWidget(self.step7_flip_lr_check)
-        manual_row.addWidget(self.step7_flip_ud_check)
+        self.step7_anchor_mode_button = QPushButton("Manual Anchor Mode")
+        self.step7_anchor_mode_button.clicked.connect(self.start_step7_anchor_mode)
         manual_row.addWidget(self.step7_update_preview_button)
+        manual_row.addWidget(self.step7_anchor_mode_button)
         manual_row.addWidget(self.step7_run_button)
+        manual_row.addStretch(1)
         middle.addLayout(manual_row)
 
         self.step7_progress_label = QLabel("Step 7 progress: idle")
@@ -1643,27 +1746,44 @@ class WorkflowWindow(QWidget):
             "\n".join(
                 [
                     "Step 7 Confocal to Myelin Local Registration",
-                    "- select a myelin section and a confocal z-stack",
-                    "- generate a focus / EDF projection or alternative 2D projection",
-                    "- adjust tx / ty / angle / scale / flips for coarse manual alignment",
-                    "- run rigid refine to produce a local storyboard and metrics",
+                    "- select a whole-section myelin crop and one or more confocal sources",
+                    "- single-source TIFF, full CZI, and multi-TIFF strip stitching are supported",
+                    "- multi-TIFF projection uses the default tile-overlap setting plus phase-corrected strip stitching",
+                    "- drag the overlay block with left mouse; right drag rotates it",
+                    "- confocal is displayed inverted against myelin and both sides use a 1.0 um/px working grid",
+                    "- orientation is currently locked to UD flip (x-axis mirror) for this confocal-to-nanozoomer setup",
+                    "- drag / rotate / flip for coarse manual alignment using local fiber patterns; tx/ty/angle/scale are recorded but kept off the main toolbar",
+                    f"- current registration input profile is {STEP7_REGISTRATION_INPUT_PROFILE}: paired percentile normalization on both sides + Gaussian blur sigma=6",
+                    "- local refine uses the default similarity model; affine remains available internally for targeted testing",
+                    "- press F to lock the confocal grid; this does not start landmark collection by itself",
+                    "- Manual Anchor Mode starts alternating anchor collection: A1 -> B1 -> A2 -> B2; keys 1-9 override the point index",
+                    "- while locked and collecting, right-click or Backspace undoes the latest anchor and restores that slot",
+                    "- A/B keys place anchors at the current cursor position; [ and ] change confocal overlay opacity",
+                    "- while locked, click the grid to select it; mouse wheel then scales it isotropically and keeps the first complete anchor fixed",
+                    "- Fiber Registration updates the quick QC storyboard using tight local before/after fiber comparisons",
+                    "- if complete anchor pairs exist, Fiber Registration uses them to stabilize the coarse confocal placement before local similarity refinement",
                 ]
             )
         )
         middle.addWidget(self.step7_info)
+        self.step7_tile_outline_label = QLabel("No tile-outline preview available")
+        self.step7_tile_outline_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.step7_tile_outline_label.setMinimumSize(240, 120)
+        self.step7_tile_outline_label.setStyleSheet("background:#f5f5f5; border:1px solid #cccccc;")
+        self.step7_tile_outline_label.setVisible(False)
+        middle.addWidget(self.step7_tile_outline_label)
 
         right = QVBoxLayout()
         right.addWidget(QLabel("Manual Preview"))
-        self.step7_preview_label = QLabel("No confocal projection preview yet")
-        self.step7_preview_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self.step7_preview_label.setMinimumSize(900, 420)
-        self.step7_preview_label.setStyleSheet("background:#f5f5f5; border:1px solid #cccccc;")
-        self.step7_preview_scroll = QScrollArea()
-        self.step7_preview_scroll.setWidgetResizable(True)
-        self.step7_preview_scroll.setWidget(self.step7_preview_label)
-        right.addWidget(self.step7_preview_scroll, 1)
-        right.addWidget(QLabel("Rigid Storyboard"))
-        self.step7_storyboard_label = QLabel("No confocal rigid storyboard yet")
+        self.step7_preview_view = ConfocalAlignmentView()
+        self.step7_preview_view.setMinimumSize(900, 420)
+        self.step7_preview_view.setStyleSheet("background:#f5f5f5; border:1px solid #cccccc;")
+        self.step7_preview_view.transformEdited.connect(self.on_step7_preview_transform_edited)
+        self.step7_preview_view.diagnosticPointPlaced.connect(self.on_step7_diagnostic_point_placed)
+        self.step7_preview_view.diagnosticStateChanged.connect(self.on_step7_diagnostic_state_changed)
+        right.addWidget(self.step7_preview_view, 1)
+        right.addWidget(QLabel("Fiber QC Storyboard"))
+        self.step7_storyboard_label = QLabel("No Step 7 fiber QC storyboard yet")
         self.step7_storyboard_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.step7_storyboard_label.setMinimumSize(900, 420)
         self.step7_storyboard_label.setStyleSheet("background:#f5f5f5; border:1px solid #cccccc;")
@@ -3005,6 +3125,7 @@ class WorkflowWindow(QWidget):
             self.step5_pair_label.setText("No registration pair selected")
             self.step5_progress_bar.setValue(0)
             self.step5_progress_label.setText("Step 5 progress: idle")
+            self._set_step5_acceptance_summary(None)
             self._set_step5_storyboard(None)
             return
         all_pairs = list_cross_stain_pairs(self.step4_myelin_root, self.step4_nissl_root)
@@ -3032,6 +3153,7 @@ class WorkflowWindow(QWidget):
         else:
             self.current_step5_pair_index = 0
             self.step5_pair_label.setText("No usable registration pair selected")
+            self._set_step5_acceptance_summary(None)
             self.step5_info.setPlainText(
                 "\n".join(
                     [
@@ -3058,11 +3180,20 @@ class WorkflowWindow(QWidget):
         reg_files = dict(review.get("registration_mask_files") or {})
         approved = dict(review.get("approved_registration") or {})
         latest_run = latest_registration_run_dir(self._step5_runs_root(), pair.pair_key)
+        latest_manifest: dict | None = None
+        if latest_run is not None:
+            manifest_path = latest_run / "run_manifest.json"
+            if manifest_path.exists():
+                try:
+                    latest_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                except Exception:
+                    latest_manifest = None
         latest_storyboard = (latest_run / "storyboard.png") if latest_run is not None else None
         if latest_storyboard is not None and latest_storyboard.exists():
             self._set_step5_storyboard(latest_storyboard)
         else:
             self._set_step5_storyboard(None)
+        self._set_step5_acceptance_summary(latest_manifest)
         self.step5_moving_side_combo.blockSignals(True)
         self.step5_fixed_side_combo.blockSignals(True)
         self.step5_moving_group_combo.blockSignals(True)
@@ -3096,11 +3227,14 @@ class WorkflowWindow(QWidget):
                     f"latest_run: {latest_run if latest_run is not None else 'none'}",
                     f"approved_run: {approved.get('run_dir', 'none')}",
                     f"approved_stage: {approved.get('approved_stage', 'none')}",
+                    f"accepted_path: {' -> '.join((latest_manifest or {}).get('accepted_stage_path') or ['input'])}",
+                    f"rejected_stages: {', '.join(self._step5_rejected_stages_from_manifest(latest_manifest or {})) or 'none'}",
                     "",
                     "Registration prep notes:",
                     "- only usable pairs are shown here",
                     "- if multi_group_registration is true, run registration for 1<->1 and 2<->2 separately",
                     "- choose moving/fixed side and group, then run ANTs rigid + affine + SyN",
+                    "- if rigid or affine is rejected, the next stage starts from the current best accepted state",
                     "- storyboard updates after each stage and includes a displacement heatmap panel",
                 ]
             )
@@ -3178,6 +3312,12 @@ class WorkflowWindow(QWidget):
             self._set_step5_storyboard(Path(str(storyboard_path)))
         if run_dir:
             self.step5_info.append(f"{stage}: {run_dir}")
+            manifest_path = Path(str(run_dir)) / "run_manifest.json"
+            if manifest_path.exists():
+                try:
+                    self._set_step5_acceptance_summary(json.loads(manifest_path.read_text(encoding="utf-8")))
+                except Exception:
+                    pass
 
     def on_step5_registration_finished(self, summary: object) -> None:
         data = dict(summary) if isinstance(summary, dict) else {}
@@ -3185,6 +3325,13 @@ class WorkflowWindow(QWidget):
         storyboard_path = data.get("storyboard_path", "")
         if storyboard_path:
             self._set_step5_storyboard(Path(str(storyboard_path)))
+        if run_dir:
+            manifest_path = Path(str(run_dir)) / "run_manifest.json"
+            if manifest_path.exists():
+                try:
+                    self._set_step5_acceptance_summary(json.loads(manifest_path.read_text(encoding="utf-8")))
+                except Exception:
+                    pass
         self.step5_progress_bar.setValue(100)
         self.step5_progress_label.setText("Step 5 progress: registration finished")
         self.step5_info.append(f"Registration finished. run_dir={run_dir}")
@@ -3197,6 +3344,12 @@ class WorkflowWindow(QWidget):
     def on_step5_registration_failed(self, message: str) -> None:
         self.step5_info.append(message)
         self.step5_progress_label.setText("Step 5 progress: registration failed")
+        self.step5_acceptance_label.setText(
+            "Accepted path: unavailable | Rejected: unavailable | Best accepted state runner: see failure log."
+        )
+        self.step5_acceptance_label.setStyleSheet(
+            "padding:6px 10px; border-radius:6px; background:#fff1e0; color:#8a3d00; border:1px solid #f1a552; font-weight:700;"
+        )
         self.step5_run_button.setEnabled(True)
         self.step5_run_worker = None
         self.step5_run_thread = None
@@ -3228,6 +3381,64 @@ class WorkflowWindow(QWidget):
             if stage in stages:
                 return stage
         return "rigid"
+
+    @staticmethod
+    def _step5_rejected_stages_from_manifest(manifest: dict) -> list[str]:
+        stages = dict(manifest.get("stages") or {})
+        rejected: list[str] = []
+        for stage in ("rigid", "affine", "syn"):
+            gate = dict(stages.get(stage, {}).get("gate") or {})
+            if gate and not bool(gate.get("accepted")):
+                rejected.append(stage)
+        return rejected
+
+    def _set_step5_acceptance_summary(self, manifest: dict | None) -> None:
+        if not manifest:
+            self.step5_acceptance_label.setText(
+                "Accepted path: input | Rejected: none | Best accepted state runner: downstream stages start from the current best state."
+            )
+            self.step5_acceptance_label.setStyleSheet(
+                "padding:6px 10px; border-radius:6px; background:#eef4fb; color:#24405c; border:1px solid #c9d8ea; font-weight:600;"
+            )
+            return
+        stages = dict(manifest.get("stages") or {})
+        has_gate_bookkeeping = bool(manifest.get("accepted_stage_path")) or any(
+            dict(stage_info.get("gate") or {}) for stage_info in stages.values()
+        )
+        if not has_gate_bookkeeping:
+            self.step5_acceptance_label.setText(
+                "Accepted path: legacy run | Rejected: legacy run | Best accepted state runner: bookkeeping not available for this older run."
+            )
+            self.step5_acceptance_label.setStyleSheet(
+                "padding:6px 10px; border-radius:6px; background:#f4f4f4; color:#555555; border:1px solid #d0d0d0; font-weight:600;"
+            )
+            return
+        accepted = [str(x) for x in (manifest.get("accepted_stage_path") or ["input"]) if str(x).strip()]
+        if not accepted:
+            accepted = ["input"]
+        rejected = self._step5_rejected_stages_from_manifest(manifest)
+        accepted_text = " -> ".join(accepted)
+        rejected_text = ", ".join(rejected) if rejected else "none"
+        best_stage = str(manifest.get("best_stage") or accepted[-1] or "input")
+        syn_requested = "syn" in {str(x).strip().lower() for x in manifest.get("run_stages") or []}
+        linear_rejected = any(stage in rejected for stage in ("rigid", "affine"))
+        linear_attempted = any(stage in stages for stage in ("rigid", "affine"))
+        note = "Best accepted state runner: downstream stages start from the current best state."
+        if syn_requested and linear_attempted and all(stage in rejected for stage in stages if stage in {"rigid", "affine"}):
+            note = "Best accepted state runner: linear stages were rejected, so nonlinear starts from the current best accepted state."
+        text = f"Accepted path: {accepted_text} | Rejected: {rejected_text} | Best: {best_stage}. {note}"
+        if rejected:
+            style = (
+                "padding:6px 10px; border-radius:6px; background:#fff1e0; color:#8a3d00; "
+                "border:1px solid #f1a552; font-weight:700;"
+            )
+        else:
+            style = (
+                "padding:6px 10px; border-radius:6px; background:#e8f6ec; color:#175c2b; "
+                "border:1px solid #b8dfc2; font-weight:600;"
+            )
+        self.step5_acceptance_label.setText(text)
+        self.step5_acceptance_label.setStyleSheet(style)
 
     def _set_rgb_image_label(self, label: QLabel, rgb: np.ndarray | None, empty_text: str) -> None:
         if rgb is None:
@@ -3584,10 +3795,564 @@ class WorkflowWindow(QWidget):
     def _step7_runs_root(self) -> Path | None:
         return default_confocal_registration_root(self.step7_myelin_root)
 
+    def _latest_step7_run_dir(self, label: str) -> Path | None:
+        runs_root = self._step7_runs_root()
+        if runs_root is None:
+            return None
+        section_root = runs_root / label
+        if not section_root.exists():
+            return None
+        candidates = [p for p in section_root.iterdir() if p.is_dir()]
+        if not candidates:
+            return None
+        return sorted(candidates)[-1]
+
     def _current_step7_item(self) -> WorkspaceSection | None:
         if 0 <= self.current_step7_section_index < len(self.step7_sections):
             return self.step7_sections[self.current_step7_section_index]
         return None
+
+    def _default_step7_confocal_root(self) -> Path:
+        if self.step7_confocal_paths:
+            first = self.step7_confocal_paths[0]
+            return first.parent if first.is_dir() else first.parent
+        preferred = Path(r"D:\Research\Image Analysis\Confocal Myelin data")
+        if preferred.exists():
+            return preferred
+        return self._default_crop_workspace_root()
+
+    def _describe_step7_confocal_sources(self) -> str:
+        if not self.step7_confocal_paths:
+            return "none"
+        if len(self.step7_confocal_paths) == 1:
+            return str(self.step7_confocal_paths[0])
+        return f"{len(self.step7_confocal_paths)} sources | first={self.step7_confocal_paths[0].name}"
+
+    @staticmethod
+    def _format_step7_scale_arrow(source_um: object, target_um: object) -> str:
+        if not isinstance(source_um, (list, tuple)) or len(source_um) != 2:
+            return "unknown -> unknown"
+        if not isinstance(target_um, (list, tuple)) or len(target_um) != 2:
+            return f"{tuple(source_um)} -> unknown"
+        return f"({float(source_um[0]):.3f}, {float(source_um[1]):.3f}) -> ({float(target_um[0]):.3f}, {float(target_um[1]):.3f})"
+
+    @staticmethod
+    def _format_step7_extent_summary(
+        *,
+        fixed_info: object,
+        projection_info: object,
+        raw_projection: object,
+        scaled_projection: object,
+    ) -> list[str]:
+        if not isinstance(fixed_info, dict) or not isinstance(projection_info, dict):
+            return []
+        fixed_support_shape = fixed_info.get("support_shape_hw")
+        fixed_source_um = fixed_info.get("source_um_per_px_xy")
+        source_um = projection_info.get("source_um_per_px_xy")
+        lines: list[str] = []
+        if (
+            isinstance(fixed_support_shape, (list, tuple))
+            and len(fixed_support_shape) == 2
+            and isinstance(fixed_source_um, (list, tuple))
+            and len(fixed_source_um) == 2
+        ):
+            support_h = float(fixed_support_shape[0])
+            support_w = float(fixed_support_shape[1])
+            lines.append(
+                "section_support_um_extent_xy: "
+                f"({support_w * float(fixed_source_um[0]):.1f}, {support_h * float(fixed_source_um[1]):.1f})"
+            )
+        if (
+            raw_projection is not None
+            and hasattr(raw_projection, "shape")
+            and isinstance(source_um, (list, tuple))
+            and len(source_um) == 2
+        ):
+            raw_h, raw_w = raw_projection.shape[:2]
+            conf_w_um = float(raw_w) * float(source_um[0])
+            conf_h_um = float(raw_h) * float(source_um[1])
+            lines.append(f"confocal_raw_projection_shape: ({int(raw_h)}, {int(raw_w)})")
+            lines.append(f"confocal_um_extent_xy: ({conf_w_um:.1f}, {conf_h_um:.1f})")
+            if (
+                isinstance(fixed_support_shape, (list, tuple))
+                and len(fixed_support_shape) == 2
+                and isinstance(fixed_source_um, (list, tuple))
+                and len(fixed_source_um) == 2
+            ):
+                support_h = float(fixed_support_shape[0])
+                support_w = float(fixed_support_shape[1])
+                sec_w_um = support_w * float(fixed_source_um[0])
+                sec_h_um = support_h * float(fixed_source_um[1])
+                if sec_w_um > 0 and sec_h_um > 0:
+                    lines.append(
+                        "confocal_vs_section_support_fraction_xy: "
+                        f"({100.0 * conf_w_um / sec_w_um:.1f}%, {100.0 * conf_h_um / sec_h_um:.1f}%)"
+                    )
+        if scaled_projection is not None and hasattr(scaled_projection, "shape"):
+            scaled_h, scaled_w = scaled_projection.shape[:2]
+            lines.append(f"confocal_scaled_preview_shape: ({int(scaled_h)}, {int(scaled_w)})")
+        return lines
+
+    @staticmethod
+    def _format_step7_grid_summary(stitch_info: object) -> list[str]:
+        if not isinstance(stitch_info, dict):
+            return []
+        grid_shape = stitch_info.get("grid_shape_rc")
+        tile_shape = stitch_info.get("tile_shape_hw")
+        step_xy = stitch_info.get("grid_step_xy_px")
+        overlap_xy = stitch_info.get("inferred_overlap_fraction_xy")
+        lines: list[str] = []
+        if isinstance(grid_shape, (list, tuple)) and len(grid_shape) == 2:
+            lines.append(f"grid_shape_rc: ({int(grid_shape[0])}, {int(grid_shape[1])})")
+        if isinstance(tile_shape, (list, tuple)) and len(tile_shape) == 2:
+            lines.append(f"tile_shape_hw: ({int(tile_shape[0])}, {int(tile_shape[1])})")
+        if isinstance(step_xy, (list, tuple)) and len(step_xy) == 2:
+            lines.append(f"grid_step_xy_px: ({float(step_xy[0]):.1f}, {float(step_xy[1]):.1f})")
+        if isinstance(overlap_xy, (list, tuple)) and len(overlap_xy) == 2:
+            overlap_x = "unknown" if overlap_xy[0] is None else f"{100.0 * float(overlap_xy[0]):.1f}%"
+            overlap_y = "unknown" if overlap_xy[1] is None else f"{100.0 * float(overlap_xy[1]):.1f}%"
+            lines.append(f"inferred_overlap_xy: ({overlap_x}, {overlap_y})")
+        return lines
+
+    def _update_step7_info_text(self) -> None:
+        item = self._current_step7_item()
+        fixed_shape = None if self.step7_fixed_rgb is None else self.step7_fixed_rgb.shape[:2]
+        fixed_um = None if self.step7_fixed_info is None else self.step7_fixed_info.get("preview_um_per_px_xy")
+        source_um = None if self.step7_projection_info is None else self.step7_projection_info.get("source_um_per_px_xy")
+        scale_info = None if self.step7_projection_info is None else self.step7_projection_info.get("scale_to_section_preview")
+        stitch_info = None if self.step7_projection_info is None else self.step7_projection_info.get("stitch_info")
+        diag = self.step7_preview_view.diagnostic_snapshot() if hasattr(self, "step7_preview_view") else {}
+        points_a = diag.get("points_a_scene", {}) if isinstance(diag, dict) else {}
+        points_b = diag.get("points_b_raw", {}) if isinstance(diag, dict) else {}
+        complete_pairs = sorted({int(k) for k in points_a.keys()} & {int(k) for k in points_b.keys()})
+        lines = [
+            f"myelin_label: {item.label if item is not None else 'none'}",
+            f"section_dir: {item.section_dir if item is not None else 'none'}",
+            f"confocal_source_mode: {self.step7_confocal_source_mode}",
+            f"confocal_sources: {self._describe_step7_confocal_sources()}",
+            f"fixed_preview_shape: {fixed_shape}",
+            f"fixed_preview_um_per_px: {fixed_um}",
+            f"step7_target_working_um_per_px: {float(STEP7_TARGET_UM_PER_PX):.1f}",
+            f"step7_registration_input_profile: {STEP7_REGISTRATION_INPUT_PROFILE}",
+            f"confocal_display_and_registration_polarity: inverted_for_myelin_matching",
+            f"source_um_per_px -> section_preview_um_per_px: {self._format_step7_scale_arrow(source_um, fixed_um)}",
+            f"manual_flip_state: LR={bool(self.step7_flip_lr_check.isChecked())}, UD={bool(self.step7_flip_ud_check.isChecked())}",
+            f"anchor_mode_active: {bool(diag.get('diagnostic_active', False))}",
+            f"anchor_target: {diag.get('next_group', 'A')}{diag.get('next_index', 1)}",
+            f"anchor_transform_locked: {bool(diag.get('transform_locked', False))}",
+            f"confocal_overlay_opacity: {float(diag.get('overlay_opacity', 0.85)):.2f}",
+            f"anchor_points: A={len(points_a)} | B={len(points_b)} | complete_pairs={complete_pairs or 'none'}",
+        ]
+        if self.step7_last_manual_action:
+            lines.append(f"last_manual_action: {self.step7_last_manual_action}")
+        if isinstance(self.step7_fixed_info, dict) and self.step7_fixed_info.get("fixed_working_mode"):
+            lines.append(f"fixed_working_mode: {self.step7_fixed_info.get('fixed_working_mode')}")
+        if isinstance(scale_info, dict):
+            lines.append(f"projection_scale_to_section: {scale_info}")
+        lines.extend(
+            self._format_step7_extent_summary(
+                fixed_info=self.step7_fixed_info,
+                projection_info=self.step7_projection_info,
+                raw_projection=self.step7_confocal_projection_raw_u8,
+                scaled_projection=self.step7_confocal_projection_u8,
+            )
+        )
+        lines.extend(self._format_step7_grid_summary(stitch_info))
+        lines.extend(self._format_step7_current_tracker_lines())
+        if self.step7_confocal_source_mode == "multi_tiff_grid":
+            lines.append("note: main preview uses section-scaled confocal; tile-outline preview shows raw mosaic grid layout")
+        lines.append("note: physical comparison is against the section support crop used in Step 7, not the full slide canvas")
+        lines.extend(
+            [
+                "",
+                "Workflow:",
+                "- select a confocal z-stack source, CZI, or multi-TIFF strip/grid",
+                "- generate a 2D projection",
+                "- adjust manual coarse alignment",
+                f"- run local refine using {STEP7_REGISTRATION_INPUT_PROFILE}",
+            ]
+        )
+        if self.step7_last_run_summary_lines:
+            lines.extend(["", *self.step7_last_run_summary_lines])
+        if self.step7_diagnostic_log:
+            lines.extend(["", "Anchor log:"])
+            lines.extend(self.step7_diagnostic_log[-20:])
+        self.step7_info.setPlainText("\n".join(lines))
+
+    def _format_step7_current_tracker_lines(self) -> list[str]:
+        snap = self.step7_preview_view.diagnostic_snapshot() if hasattr(self, "step7_preview_view") else {}
+        points_a = snap.get("points_a_scene", {}) if isinstance(snap, dict) else {}
+        points_b = snap.get("points_b_raw", {}) if isinstance(snap, dict) else {}
+        points_b_scene = snap.get("points_b_scene", {}) if isinstance(snap, dict) else {}
+        pair_ids = sorted({int(k) for k in points_a.keys()} & {int(k) for k in points_b.keys()})
+        lines = [
+            "current_repro_tracker:",
+            (
+                "  manual_transform: "
+                f"tx={float(self.step7_tx_spin.value()):.1f} "
+                f"ty={float(self.step7_ty_spin.value()):.1f} "
+                f"angle={float(self.step7_angle_spin.value()):.1f} "
+                f"scale={float(self.step7_scale_spin.value()):.5f} "
+                f"flip(LR,UD)=({bool(self.step7_flip_lr_check.isChecked())},{bool(self.step7_flip_ud_check.isChecked())})"
+            ),
+            (
+                "  tracker_ready: "
+                f"complete_anchor_pairs={pair_ids or 'none'} "
+                f"source_mode={self.step7_confocal_source_mode or 'none'} "
+                f"projection={str(self.step7_projection_mode_combo.currentData() or 'focus')}"
+            ),
+        ]
+        if pair_ids:
+            lines.append("  anchor_pairs_explicit:")
+            for idx in pair_ids[:9]:
+                a = points_a.get(str(idx), [float("nan"), float("nan")])
+                b_scene = points_b_scene.get(str(idx), [float("nan"), float("nan")])
+                b_raw = points_b.get(str(idx), [float("nan"), float("nan")])
+                lines.append(
+                    f"    A{idx}=({float(a[0]):.1f},{float(a[1]):.1f}) | "
+                    f"B{idx}_scene=({float(b_scene[0]):.1f},{float(b_scene[1]):.1f}) | "
+                    f"B{idx}_raw=({float(b_raw[0]):.1f},{float(b_raw[1]):.1f})"
+                )
+        return lines
+
+    def _reset_step7_diagnostic_state(self) -> None:
+        self.step7_diagnostic_log = []
+        if hasattr(self, "step7_preview_view"):
+            self.step7_preview_view.clear_diagnostic_points()
+
+    @staticmethod
+    def _fmt_step7_metric(value: object, *, digits: int = 4) -> str:
+        try:
+            val = float(value)
+        except Exception:
+            return "nan"
+        if not np.isfinite(val):
+            return "inf" if val > 0 else "-inf"
+        return f"{val:.{digits}f}"
+
+    def _build_step7_run_summary_lines(self, data: dict[str, object]) -> list[str]:
+        refine_model = str(
+            data.get("local_refine_model")
+            or (data.get("local_registration") if isinstance(data.get("local_registration"), dict) else {}).get("transform_model")
+            or "similarity"
+        )
+        run_dir = str(data.get("run_dir") or "").strip()
+        input_metrics = data.get("input_metrics") if isinstance(data.get("input_metrics"), dict) else {}
+        refine_metrics = (
+            data.get("refine_metrics")
+            if isinstance(data.get("refine_metrics"), dict)
+            else (data.get("rigid_metrics") if isinstance(data.get("rigid_metrics"), dict) else {})
+        )
+        full_input_metrics = data.get("full_input_metrics") if isinstance(data.get("full_input_metrics"), dict) else {}
+        full_refine_metrics = (
+            data.get("full_refine_metrics")
+            if isinstance(data.get("full_refine_metrics"), dict)
+            else (data.get("full_rigid_metrics") if isinstance(data.get("full_rigid_metrics"), dict) else {})
+        )
+        timing = data.get("timing_seconds") if isinstance(data.get("timing_seconds"), dict) else {}
+        manual_init = data.get("manual_init") if isinstance(data.get("manual_init"), dict) else {}
+        coarse = data.get("coarse_alignment_record") if isinstance(data.get("coarse_alignment_record"), dict) else {}
+        local_info = data.get("local_registration") if isinstance(data.get("local_registration"), dict) else {}
+        roi_bbox = local_info.get("roi_bbox_yxyx") if isinstance(local_info.get("roi_bbox_yxyx"), list) else coarse.get("local_roi_bbox_yxyx")
+        zoom_bbox = local_info.get("fiber_qc_zoom_bbox_yxyx") if isinstance(local_info.get("fiber_qc_zoom_bbox_yxyx"), list) else coarse.get("fiber_qc_zoom_bbox_yxyx")
+        files = data.get("files") if isinstance(data.get("files"), dict) else {}
+        anchor_info = data.get("manual_anchor_mode") if isinstance(data.get("manual_anchor_mode"), dict) else {}
+        lines = [
+            "Last Step 7 run:",
+            f"- refine_model: {refine_model}",
+            (
+                "- registration_input_profile: "
+                f"{str(data.get('registration_input_profile') or local_info.get('registration_input_profile') or STEP7_REGISTRATION_INPUT_PROFILE)}"
+            ),
+            (
+                "- local pattern metrics (registration input): "
+                f"CC {self._fmt_step7_metric(input_metrics.get('cc'))} -> {self._fmt_step7_metric(refine_metrics.get('cc'))} | "
+                f"MI {self._fmt_step7_metric(input_metrics.get('mi'))} -> {self._fmt_step7_metric(refine_metrics.get('mi'))}"
+            ),
+            (
+                "- local geometry diagnostics: "
+                f"Dice {self._fmt_step7_metric(input_metrics.get('dice'))} -> {self._fmt_step7_metric(refine_metrics.get('dice'))} | "
+                f"HD95 {self._fmt_step7_metric(input_metrics.get('hd95_px'), digits=1)} -> {self._fmt_step7_metric(refine_metrics.get('hd95_px'), digits=1)}"
+            ),
+            (
+                "- whole-slice diagnostics: "
+                f"CC {self._fmt_step7_metric(full_input_metrics.get('cc'))} -> {self._fmt_step7_metric(full_refine_metrics.get('cc'))} | "
+                f"MI {self._fmt_step7_metric(full_input_metrics.get('mi'))} -> {self._fmt_step7_metric(full_refine_metrics.get('mi'))}"
+            ),
+            (
+                "- timing_seconds: "
+                f"ants={self._fmt_step7_metric(timing.get('ants_registration'), digits=2)} "
+                f"total={self._fmt_step7_metric(timing.get('total'), digits=2)}"
+            ),
+        ]
+        if run_dir:
+            lines.append(f"- run_dir: {run_dir}")
+        if manual_init:
+            lines.append(
+                "- coarse manual state: "
+                f"tx={self._fmt_step7_metric(manual_init.get('tx_px'), digits=1)} "
+                f"ty={self._fmt_step7_metric(manual_init.get('ty_px'), digits=1)} "
+                f"angle={self._fmt_step7_metric(manual_init.get('angle_deg'), digits=1)} "
+                f"scale={self._fmt_step7_metric(manual_init.get('scale'), digits=4)} "
+                f"flip(LR,UD)=({bool(manual_init.get('flip_lr'))},{bool(manual_init.get('flip_ud'))})"
+            )
+        if anchor_info:
+            lines.append(
+                "- manual_anchor_mode: "
+                f"used={bool(anchor_info.get('used', False))} "
+                f"model={anchor_info.get('model', 'none')} "
+                f"pair_count={int(anchor_info.get('pair_count', 0) or 0)}"
+            )
+        if roi_bbox:
+            lines.append(f"- local_roi_bbox_yxyx: {tuple(int(v) for v in roi_bbox)}")
+        if zoom_bbox:
+            lines.append(f"- fiber_qc_zoom_bbox_yxyx: {tuple(int(v) for v in zoom_bbox)}")
+        if files:
+            full_ref = str(files.get("coarse_alignment_overlay_full") or "").strip()
+            local_ref = str(files.get("coarse_alignment_overlay_local") or "").strip()
+            if full_ref or local_ref:
+                lines.append(
+                    "- coarse alignment snapshots: "
+                    f"full=`{full_ref}` local=`{local_ref}`"
+                )
+            repro_tracker_ref = str(files.get("repro_tracker") or "").strip()
+            if repro_tracker_ref:
+                lines.append(f"- repro_tracker: `{repro_tracker_ref}`")
+        return lines
+
+    def _load_step7_fixed_section(self, item: WorkspaceSection) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
+        cached = self.step7_fixed_cache.get(item.label)
+        if cached is not None:
+            return cached
+        bundle = prepare_myelin_confocal_fixed_bundle(item, max_long_edge=None, target_um_per_px=STEP7_TARGET_UM_PER_PX)
+        info = {
+            "preview_um_per_px_xy": list(bundle.preview_um_per_px_xy) if bundle.preview_um_per_px_xy is not None else None,
+            "source_um_per_px_xy": list(bundle.source_um_per_px_xy) if bundle.source_um_per_px_xy is not None else None,
+            "support_shape_hw": [int(bundle.support_shape_hw[0]), int(bundle.support_shape_hw[1])],
+            "preview_shape_hw": [int(bundle.preview_shape_hw[0]), int(bundle.preview_shape_hw[1])],
+            "support_bbox_canvas_xywh": list(bundle.support_bbox_canvas_xywh) if bundle.support_bbox_canvas_xywh is not None else None,
+            "fixed_working_mode": bundle.fixed_working_mode,
+            "target_um_per_px_xy": list(bundle.target_um_per_px_xy) if bundle.target_um_per_px_xy is not None else None,
+        }
+        cached = (bundle.rgb, bundle.labels, info)
+        self.step7_fixed_cache[item.label] = cached
+        return cached
+
+    def _refresh_step7_projection_to_current_section(self) -> None:
+        if self.step7_confocal_projection_raw_u8 is None:
+            self.step7_confocal_projection_u8 = None
+            self.step7_confocal_projection_mask_u8 = None
+            return
+        info = dict(self.step7_projection_info or {})
+        source_um = info.get("source_um_per_px_xy")
+        target_um = None if self.step7_fixed_info is None else self.step7_fixed_info.get("preview_um_per_px_xy")
+        projection, scale_info = _resample_projection_to_target_um_per_px(
+            self.step7_confocal_projection_raw_u8,
+            source_um_per_px_xy=tuple(source_um) if isinstance(source_um, (list, tuple)) and len(source_um) == 2 else None,
+            target_um_per_px_xy=tuple(target_um) if isinstance(target_um, (list, tuple)) and len(target_um) == 2 else None,
+        )
+        self.step7_confocal_projection_u8 = projection
+        raw_mask = (
+            np.where(np.asarray(self.step7_confocal_projection_mask_raw_u8) > 0, 255, 0).astype(np.uint8)
+            if self.step7_confocal_projection_mask_raw_u8 is not None
+            else np.where(np.asarray(self.step7_confocal_projection_raw_u8) > 0, 255, 0).astype(np.uint8)
+        )
+        self.step7_confocal_projection_mask_u8 = _resample_mask_to_target_um_per_px(
+            raw_mask,
+            source_um_per_px_xy=tuple(source_um) if isinstance(source_um, (list, tuple)) and len(source_um) == 2 else None,
+            target_um_per_px_xy=tuple(target_um) if isinstance(target_um, (list, tuple)) and len(target_um) == 2 else None,
+        )
+        if self.step7_confocal_projection_mask_u8 is not None:
+            self.step7_confocal_projection_mask_u8 = np.where(self.step7_confocal_projection_mask_u8 > 0, 255, 0).astype(np.uint8)
+        if self.step7_projection_info is not None:
+            self.step7_projection_info["scale_to_section_preview"] = scale_info
+            self.step7_projection_info["target_um_per_px_xy"] = list(target_um) if isinstance(target_um, (list, tuple)) and len(target_um) == 2 else None
+            self.step7_projection_info["raw_projection_shape_hw"] = [
+                int(self.step7_confocal_projection_raw_u8.shape[0]),
+                int(self.step7_confocal_projection_raw_u8.shape[1]),
+            ]
+            self.step7_projection_info["scaled_projection_shape_hw"] = [int(projection.shape[0]), int(projection.shape[1])]
+
+    def update_step7_tile_outline_preview(self) -> None:
+        if not hasattr(self, "step7_tile_outline_label"):
+            return
+        enabled = bool(self.step7_show_tile_outline_check.isChecked())
+        self.step7_tile_outline_label.setVisible(enabled)
+        if not enabled:
+            return
+        info = dict(self.step7_projection_info or {})
+        stitch_info = dict(info.get("stitch_info") or {})
+        positions = stitch_info.get("tile_positions_xy")
+        source_shapes = info.get("source_shapes")
+        if (
+            self.step7_confocal_projection_raw_u8 is None
+            or not isinstance(positions, list)
+            or not positions
+            or not isinstance(source_shapes, list)
+            or not source_shapes
+        ):
+            self._set_rgb_image_label(self.step7_tile_outline_label, None, "No tile-outline preview available")
+            return
+        raw = np.asarray(self.step7_confocal_projection_raw_u8, dtype=np.uint8)
+        preview = np.full((raw.shape[0], raw.shape[1], 3), 18, dtype=np.uint8)
+        if raw.size:
+            raw_rgb = cv2.cvtColor(raw, cv2.COLOR_GRAY2RGB)
+            preview = cv2.addWeighted(preview, 0.7, raw_rgb, 0.3, 0.0)
+        tile_h = int(source_shapes[0][-2]) if len(source_shapes[0]) >= 2 else None
+        tile_w = int(source_shapes[0][-1]) if len(source_shapes[0]) >= 1 else None
+        if tile_h is None or tile_w is None or tile_h <= 0 or tile_w <= 0:
+            self._set_rgb_image_label(self.step7_tile_outline_label, preview, "No tile-outline preview available")
+            return
+        unique_xs = sorted({int(pos[0]) for pos in positions if isinstance(pos, (list, tuple)) and len(pos) == 2})
+        unique_ys = sorted({int(pos[1]) for pos in positions if isinstance(pos, (list, tuple)) and len(pos) == 2})
+        x_to_col = {x: idx for idx, x in enumerate(unique_xs)}
+        y_to_row = {y: idx for idx, y in enumerate(unique_ys)}
+        for idx, pos in enumerate(positions):
+            if not isinstance(pos, (list, tuple)) or len(pos) != 2:
+                continue
+            x0 = int(pos[0])
+            y0 = int(pos[1])
+            cv2.rectangle(preview, (x0, y0), (x0 + tile_w - 1, y0 + tile_h - 1), (255, 220, 0), 3)
+            cv2.putText(
+                preview,
+                f"{idx} r{y_to_row.get(y0, '?')}c{x_to_col.get(x0, '?')}",
+                (x0 + 8, y0 + 28),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (255, 80, 80),
+                2,
+                cv2.LINE_AA,
+            )
+        summary = stitch_info.get("grid_shape_rc")
+        if isinstance(summary, (list, tuple)) and len(summary) == 2:
+            cv2.putText(
+                preview,
+                f"raw grid {int(summary[1])}x{int(summary[0])}",
+                (12, max(24, preview.shape[0] - 12)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (120, 255, 120),
+                2,
+                cv2.LINE_AA,
+            )
+        long_edge = max(preview.shape[:2])
+        if long_edge > 360:
+            scale = 360.0 / float(long_edge)
+            preview = cv2.resize(
+                preview,
+                (max(1, int(round(preview.shape[1] * scale))), max(1, int(round(preview.shape[0] * scale)))),
+                interpolation=cv2.INTER_AREA,
+            )
+        self._set_rgb_image_label(self.step7_tile_outline_label, preview, "No tile-outline preview available")
+
+    def _set_step7_transform_spins(self, tx_px: float, ty_px: float, angle_deg: float, scale: float) -> None:
+        for spin, value in (
+            (self.step7_tx_spin, tx_px),
+            (self.step7_ty_spin, ty_px),
+            (self.step7_angle_spin, angle_deg),
+            (self.step7_scale_spin, scale),
+        ):
+            spin.blockSignals(True)
+            spin.setValue(float(value))
+            spin.blockSignals(False)
+
+    def _append_step7_diagnostic_log(self, line: str) -> None:
+        self.step7_diagnostic_log.append(str(line))
+        self._update_step7_info_text()
+
+    def start_step7_anchor_mode(self) -> None:
+        if self.step7_confocal_projection_u8 is None or self.step7_fixed_rgb is None:
+            QMessageBox.warning(self, "Step 7 Anchors", "Generate a projection first, then start Manual Anchor Mode.")
+            return
+        if hasattr(self.step7_preview_view, "activate_anchor_mode"):
+            self.step7_preview_view.activate_anchor_mode()
+        self.step7_last_manual_action = "anchor_mode_started"
+        self._append_step7_diagnostic_log("Anchor mode: started. Next target A1.")
+
+    def on_step7_diagnostic_state_changed(self, payload: object) -> None:
+        data = dict(payload) if isinstance(payload, dict) else {}
+        event_name = str(data.get("event") or "")
+        if event_name == "lock_toggled":
+            self.step7_last_manual_action = f"grid_lock={'on' if bool(data.get('transform_locked')) else 'off'}"
+        elif event_name == "opacity_changed":
+            self.step7_last_manual_action = f"overlay_opacity={float(data.get('overlay_opacity', 0.85)):.2f}"
+        elif event_name in {"target_manual", "target_advanced", "anchor_mode_started"}:
+            self.step7_last_manual_action = f"anchor_target={data.get('next_group', 'A')}{data.get('next_index', 1)}"
+        elif event_name in {"point_deleted", "point_undone"}:
+            self.step7_last_manual_action = f"undo_to_{data.get('next_group', 'A')}{data.get('next_index', 1)}"
+        elif event_name == "reset":
+            self.step7_last_manual_action = "anchor_reset"
+        self._update_step7_info_text()
+
+    def on_step7_diagnostic_point_placed(self, payload: object) -> None:
+        data = dict(payload) if isinstance(payload, dict) else {}
+        group = str(data.get("group") or "?")
+        idx = int(data.get("index") or 0)
+        scene_xy = data.get("scene_xy") or [float("nan"), float("nan")]
+        if group == "A":
+            msg = f"A{idx}: section_scene_xy=({scene_xy[0]:.1f}, {scene_xy[1]:.1f})"
+        else:
+            raw_xy = data.get("overlay_raw_xy") or [float("nan"), float("nan")]
+            disp_xy = data.get("overlay_display_xy") or [float("nan"), float("nan")]
+            signal_class = str(data.get("signal_class") or "unknown").replace("_", " ")
+            msg = (
+                f"B{idx}: section_scene_xy=({scene_xy[0]:.1f}, {scene_xy[1]:.1f}) | "
+                f"confocal_display_xy=({disp_xy[0]:.1f}, {disp_xy[1]:.1f}) | "
+                f"confocal_raw_xy=({raw_xy[0]:.1f}, {raw_xy[1]:.1f}) | "
+                f"B point {signal_class}"
+            )
+        self._append_step7_diagnostic_log(msg)
+
+    def analyze_step7_landmarks(self) -> None:
+        snap = self.step7_preview_view.diagnostic_snapshot()
+        points_a = snap.get("points_a_scene", {}) if isinstance(snap, dict) else {}
+        points_b = snap.get("points_b_raw", {}) if isinstance(snap, dict) else {}
+        pair_ids = sorted({int(k) for k in points_a.keys()} & {int(k) for k in points_b.keys()})
+        if len(pair_ids) < 2:
+            self._append_step7_diagnostic_log("Analyze: need at least 2 complete A/B pairs.")
+            return
+        src = np.asarray([points_b[str(idx)] for idx in pair_ids], dtype=np.float64)
+        dst = np.asarray([points_a[str(idx)] for idx in pair_ids], dtype=np.float64)
+        rigid = _fit_step7_procrustes(src, dst, allow_scale=False)
+        similarity = _fit_step7_procrustes(src, dst, allow_scale=True)
+        affine = _fit_step7_affine(src, dst) if len(pair_ids) >= 3 else None
+        lines = [
+            f"Analyze: pairs={pair_ids}",
+            (
+                "  rigid: "
+                f"rms={rigid['rms_px']:.2f}px mean={rigid['mean_px']:.2f}px max={rigid['max_px']:.2f}px "
+                f"rot={rigid['rotation_deg']:.2f}deg trans=({rigid['translation_xy'][0]:.2f},{rigid['translation_xy'][1]:.2f})"
+            ),
+            (
+                "  similarity: "
+                f"rms={similarity['rms_px']:.2f}px mean={similarity['mean_px']:.2f}px max={similarity['max_px']:.2f}px "
+                f"rot={similarity['rotation_deg']:.2f}deg scale={similarity['scale']:.5f}"
+            ),
+        ]
+        diagnosis = "  diagnosis: similarity does not improve enough over rigid yet."
+        rigid_rms = float(rigid["rms_px"])
+        sim_rms = float(similarity["rms_px"])
+        if affine is not None:
+            lines.append(
+                "  affine: "
+                f"rms={affine['rms_px']:.2f}px mean={affine['mean_px']:.2f}px max={affine['max_px']:.2f}px "
+                f"scale_x_like={affine['scale_x_like']:.5f} scale_y_like={affine['scale_y_like']:.5f} "
+                f"shear_like={affine['shear_like']:.5f}"
+            )
+            aff_rms = float(affine["rms_px"])
+            if sim_rms < rigid_rms * 0.80 and aff_rms >= sim_rms * 0.92:
+                diagnosis = "  diagnosis: scale/rotation mismatch dominates; similarity likely enough."
+            elif aff_rms < sim_rms * 0.80:
+                diagnosis = "  diagnosis: affine gives a clear extra gain; anisotropic scale or shear is likely."
+            elif aff_rms < sim_rms * 0.95:
+                diagnosis = "  diagnosis: affine helps modestly; weak shear or axis-specific scale is plausible."
+            elif aff_rms > sim_rms * 0.98 and sim_rms > rigid_rms * 0.98:
+                diagnosis = "  diagnosis: higher-order mismatch remains; if residual vectors stay structured, nonlinear may be needed."
+        elif sim_rms < rigid_rms * 0.80:
+            diagnosis = "  diagnosis: two-point screen suggests scale/rotation mismatch."
+        lines.append(diagnosis)
+        for line in lines:
+            self._append_step7_diagnostic_log(line)
 
     def refresh_step7_sections(self) -> None:
         if self.step7_myelin_root is None:
@@ -3611,110 +4376,139 @@ class WorkflowWindow(QWidget):
                     f"myelin_root: {self.step7_myelin_root}",
                     f"confocal_runs_root: {self._step7_runs_root()}",
                     f"myelin_sections: {len(self.step7_sections)}",
+                    f"fixed_cache_entries: {len(self.step7_fixed_cache)}",
                 ]
             )
         )
         if self.step7_sections:
             matched_idx = next((i for i, item in enumerate(self.step7_sections) if item.label == current_label), None)
             self.current_step7_section_index = matched_idx if matched_idx is not None else min(self.current_step7_section_index, len(self.step7_sections) - 1)
-            self.step7_section_list.setCurrentRow(self.current_step7_section_index)
-            self.on_step7_section_changed(self.current_step7_section_index)
+            if self.step7_section_list.currentRow() != self.current_step7_section_index:
+                self.step7_section_list.setCurrentRow(self.current_step7_section_index)
+            else:
+                self.on_step7_section_changed(self.current_step7_section_index)
 
     def on_step7_section_changed(self, index: int) -> None:
         if index < 0 or index >= len(self.step7_sections):
             return
         self.current_step7_section_index = index
         item = self.step7_sections[index]
-        fixed_rgb, fixed_labels = prepare_myelin_confocal_fixed(item)
+        fixed_rgb, fixed_labels, fixed_info = self._load_step7_fixed_section(item)
         self.step7_fixed_rgb = fixed_rgb
         self.step7_fixed_labels = fixed_labels
+        self.step7_fixed_info = fixed_info
+        self.step7_last_run_dir = None
+        self.step7_last_run_summary_lines = []
+        self._reset_step7_diagnostic_state()
+        self._refresh_step7_projection_to_current_section()
         self.step7_pair_label.setText(f"{index + 1}/{len(self.step7_sections)} | {item.label}")
-        self.step7_storyboard_label.setText("No confocal rigid storyboard yet")
+        self.step7_storyboard_label.setText("No Step 7 fiber QC storyboard yet")
         self.step7_storyboard_label.setPixmap(QPixmap())
-        self.step7_info.setPlainText(
-            "\n".join(
-                [
-                    f"myelin_label: {item.label}",
-                    f"section_dir: {item.section_dir}",
-                    f"confocal_stack: {self.step7_confocal_path if self.step7_confocal_path is not None else 'none'}",
-                    "",
-                    "Workflow:",
-                    "- select a confocal z-stack",
-                    "- generate a 2D projection",
-                    "- adjust manual coarse alignment",
-                    "- run rigid refine",
-                ]
-            )
-        )
+        self._update_step7_info_text()
+        self.update_step7_tile_outline_preview()
         self.update_step7_preview()
 
     def select_step7_confocal_stack(self) -> None:
-        default_dir = str(self.step7_myelin_root if self.step7_myelin_root is not None else self._default_crop_workspace_root())
-        file_path, _ = QFileDialog.getOpenFileName(
+        default_dir = str(self._default_step7_confocal_root())
+        file_paths, _ = QFileDialog.getOpenFileNames(
             self,
-            "Select Confocal Z-Stack",
+            "Select Confocal Source(s)",
             default_dir,
-            "TIFF stacks (*.tif *.tiff);;All Files (*)",
+            "Confocal stacks (*.tif *.tiff *.czi);;All Files (*)",
         )
-        if not file_path:
+        if not file_paths:
             return
-        self.step7_confocal_path = Path(file_path)
+        selected = [Path(path) for path in file_paths]
+        suffixes = {path.suffix.lower() for path in selected}
+        if len(selected) > 1 and ".czi" in suffixes:
+            QMessageBox.warning(self, "Step 7 Confocal", "Select either one .czi file or multiple TIFF tiles, not both.")
+            return
+        self.step7_confocal_paths = sorted(selected)
+        self.step7_confocal_source_mode = "czi_whole" if len(selected) == 1 and selected[0].suffix.lower() == ".czi" else ("multi_tiff_strip" if len(selected) > 1 else "single_tiff")
+        self.step7_projection_info = None
+        self.step7_confocal_projection_raw_u8 = None
         self.step7_confocal_projection_u8 = None
-        self.step7_stack_label.setText(str(self.step7_confocal_path))
-        self.step7_storyboard_label.setText("No confocal rigid storyboard yet")
+        self.step7_confocal_projection_mask_raw_u8 = None
+        self.step7_confocal_projection_mask_u8 = None
+        self.step7_last_run_dir = None
+        self.step7_last_run_summary_lines = []
+        self._reset_step7_diagnostic_state()
+        self.step7_stack_label.setText(self._describe_step7_confocal_sources())
+        self.step7_storyboard_label.setText("No Step 7 fiber QC storyboard yet")
         self.step7_storyboard_label.setPixmap(QPixmap())
-        self.step7_preview_label.setText("Generate a projection to preview coarse alignment.")
-        self.step7_preview_label.setPixmap(QPixmap())
+        self._update_step7_info_text()
+        self.update_step7_tile_outline_preview()
+        self.update_step7_preview()
 
     def generate_step7_projection(self) -> None:
-        if self.step7_confocal_path is None:
-            QMessageBox.warning(self, "Step 7 Confocal", "Select a confocal z-stack first.")
+        if not self.step7_confocal_paths:
+            QMessageBox.warning(self, "Step 7 Confocal", "Select one or more confocal sources first.")
             return
-        try:
-            import tifffile
-        except Exception as exc:
-            QMessageBox.warning(self, "Step 7 Confocal", f"tifffile is required:\n{exc}")
-            return
-        stack = np.asarray(tifffile.imread(str(self.step7_confocal_path)))
-        channel_count = infer_stack_channel_count(stack)
-        self.step7_channel_spin.setMaximum(max(0, channel_count - 1))
         channel_index = int(self.step7_channel_spin.value())
         mode = str(self.step7_projection_mode_combo.currentData() or "focus")
-        self.step7_confocal_projection_u8 = project_confocal_stack(stack, mode=mode, channel_index=channel_index)
-        self.step7_info.append(
-            f"Generated confocal projection: mode={mode} channel={channel_index} shape={self.step7_confocal_projection_u8.shape}"
+        self.step7_progress_label.setText("Step 7 progress: generating projection ...")
+        QApplication.processEvents()
+        bundle = load_confocal_projection(
+            self.step7_confocal_paths,
+            mode=mode,
+            channel_index=channel_index,
+            nominal_overlap_fraction=float(self.step7_overlap_spin.value()),
         )
+        self.step7_channel_spin.setMaximum(max(0, int(bundle.channel_count) - 1))
+        self.step7_confocal_projection_raw_u8 = bundle.projection_u8
+        self.step7_confocal_projection_mask_raw_u8 = np.where(bundle.projection_u8 > 0, 255, 0).astype(np.uint8)
+        self.step7_confocal_source_mode = bundle.source_mode
+        self.step7_projection_info = {
+            "source_mode": bundle.source_mode,
+            "source_paths": bundle.source_paths,
+            "source_shapes": bundle.source_shapes,
+            "stitch_info": bundle.stitch_info,
+            "source_um_per_px_xy": list(bundle.physical_um_per_px_xy) if bundle.physical_um_per_px_xy is not None else None,
+        }
+        self.step7_last_run_summary_lines = []
+        self._reset_step7_diagnostic_state()
+        self._refresh_step7_projection_to_current_section()
+        self.step7_progress_label.setText("Step 7 progress: projection ready")
+        self._update_step7_info_text()
+        if bundle.source_mode in {"multi_tiff_strip", "multi_tiff_grid"}:
+            self.step7_info.append(f"Stitch info: {json.dumps(bundle.stitch_info, ensure_ascii=True)}")
+        self.update_step7_tile_outline_preview()
         self.update_step7_preview()
+
+    def on_step7_preview_transform_edited(self, tx_px: float, ty_px: float, angle_deg: float, scale: float) -> None:
+        self._set_step7_transform_spins(tx_px, ty_px, angle_deg, scale)
+        self.step7_last_manual_action = (
+            f"manual_transform_updated -> tx={float(tx_px):.1f} "
+            f"ty={float(ty_px):.1f} angle={float(angle_deg):.1f} scale={float(scale):.5f}"
+        )
+        self._update_step7_info_text()
 
     def update_step7_preview(self) -> None:
         if self.step7_fixed_rgb is None or self.step7_fixed_labels is None:
-            self._set_rgb_image_label(self.step7_preview_label, None, "No myelin section selected")
+            self.step7_preview_view.clear_all()
             return
-        if self.step7_confocal_projection_u8 is None:
-            self._set_rgb_image_label(self.step7_preview_label, self.step7_fixed_rgb, "No confocal projection preview yet")
-            return
-        warped, _warped_mask, _mat = apply_manual_transform(
-            self.step7_confocal_projection_u8,
-            self.step7_fixed_rgb.shape[:2],
-            tx_px=float(self.step7_tx_spin.value()),
-            ty_px=float(self.step7_ty_spin.value()),
-            angle_deg=float(self.step7_angle_spin.value()),
-            scale=float(self.step7_scale_spin.value()),
+        self.step7_preview_view.set_fixed_rgb(self.step7_fixed_rgb)
+        display_projection = None if self.step7_confocal_projection_u8 is None else _invert_confocal_u8(self.step7_confocal_projection_u8)
+        self.step7_preview_view.set_overlay_gray(
+            display_projection,
+            alpha_source_u8=self.step7_confocal_projection_u8,
             flip_lr=bool(self.step7_flip_lr_check.isChecked()),
             flip_ud=bool(self.step7_flip_ud_check.isChecked()),
         )
-        fixed_gray_u8 = cv2.cvtColor(self.step7_fixed_rgb, cv2.COLOR_RGB2GRAY)
-        base = cv2.cvtColor(fixed_gray_u8, cv2.COLOR_GRAY2RGB)
-        preview = base.copy()
-        confocal_rgb = cv2.cvtColor(warped, cv2.COLOR_GRAY2RGB)
-        mask = warped > 0
-        if np.any(mask):
-            preview[mask] = np.clip(
-                0.55 * preview[mask].astype(np.float32) + 0.45 * confocal_rgb[mask].astype(np.float32),
-                0,
-                255,
-            ).astype(np.uint8)
-        self._set_rgb_image_label(self.step7_preview_label, preview, "No confocal projection preview yet")
+        self.step7_preview_view.set_alignment(
+            float(self.step7_tx_spin.value()),
+            float(self.step7_ty_spin.value()),
+            float(self.step7_angle_spin.value()),
+            float(self.step7_scale_spin.value()),
+        )
+
+    def on_step7_flip_changed(self) -> None:
+        self.step7_last_manual_action = (
+            f"flip_changed -> LR={bool(self.step7_flip_lr_check.isChecked())}, "
+            f"UD={bool(self.step7_flip_ud_check.isChecked())}"
+        )
+        self.update_step7_preview()
+        self._update_step7_info_text()
 
     def run_step7_registration(self) -> None:
         if self.step7_run_thread is not None:
@@ -3726,7 +4520,7 @@ class WorkflowWindow(QWidget):
         if item is None or self.step7_fixed_rgb is None or self.step7_fixed_labels is None:
             QMessageBox.warning(self, "Step 7 Confocal", "Select a myelin section first.")
             return
-        if self.step7_confocal_projection_u8 is None or self.step7_confocal_path is None:
+        if self.step7_confocal_projection_u8 is None or not self.step7_confocal_paths:
             QMessageBox.warning(self, "Step 7 Confocal", "Generate a confocal projection first.")
             return
         if runs_root is None:
@@ -3735,25 +4529,56 @@ class WorkflowWindow(QWidget):
         if ants_bin is None:
             QMessageBox.warning(self, "Step 7 Confocal", "Could not find a local ANTs installation.")
             return
+        snap = self.step7_preview_view.diagnostic_snapshot() if hasattr(self, "step7_preview_view") else {}
+        points_a = snap.get("points_a_scene", {}) if isinstance(snap, dict) else {}
+        points_b = snap.get("points_b_raw", {}) if isinstance(snap, dict) else {}
+        points_b_scene = snap.get("points_b_scene", {}) if isinstance(snap, dict) else {}
+        complete_pair_ids = sorted({int(k) for k in points_a.keys()} & {int(k) for k in points_b.keys()})
+        anchor_pairs = [
+            {
+                "index": int(idx),
+                "section_scene_xy": [float(points_a[str(idx)][0]), float(points_a[str(idx)][1])],
+                "confocal_raw_xy": [float(points_b[str(idx)][0]), float(points_b[str(idx)][1])],
+                "confocal_scene_xy": [
+                    float((points_b_scene.get(str(idx)) or [float("nan"), float("nan")])[0]),
+                    float((points_b_scene.get(str(idx)) or [float("nan"), float("nan")])[1]),
+                ],
+            }
+            for idx in complete_pair_ids
+        ]
         cfg = ConfocalRigidConfig(
             myelin_label=item.label,
+            myelin_section_dir=item.section_dir,
+            myelin_stain=item.stain,
             myelin_rgb=self.step7_fixed_rgb,
             myelin_labels=self.step7_fixed_labels,
+            myelin_fixed_info=dict(self.step7_fixed_info or {}),
             confocal_projection_u8=self.step7_confocal_projection_u8,
+            confocal_signal_mask_u8=self.step7_confocal_projection_mask_u8,
             ants_bin=ants_bin,
             out_root=runs_root,
-            confocal_source=self.step7_confocal_path,
+            confocal_sources=list(self.step7_confocal_paths),
+            confocal_source_mode=self.step7_confocal_source_mode,
+            nominal_overlap_fraction=float(self.step7_overlap_spin.value()),
+            projection_info=dict(self.step7_projection_info or {}),
             projection_mode=str(self.step7_projection_mode_combo.currentData() or "focus"),
             channel_index=int(self.step7_channel_spin.value()),
+            local_refine_model=str(self.step7_refine_model_combo.currentData() or "similarity"),
+            registration_input_profile=str(STEP7_REGISTRATION_INPUT_PROFILE),
+            target_working_um_per_px=float(STEP7_TARGET_UM_PER_PX),
+            invert_confocal_for_registration=True,
             tx_px=float(self.step7_tx_spin.value()),
             ty_px=float(self.step7_ty_spin.value()),
             angle_deg=float(self.step7_angle_spin.value()),
             scale=float(self.step7_scale_spin.value()),
             flip_lr=bool(self.step7_flip_lr_check.isChecked()),
             flip_ud=bool(self.step7_flip_ud_check.isChecked()),
+            anchor_pairs=anchor_pairs,
         )
         self.step7_run_button.setEnabled(False)
-        self.step7_progress_label.setText("Step 7 progress: running rigid refine ...")
+        self.step7_progress_label.setText(
+            f"Step 7 progress: running fiber registration ({str(self.step7_refine_model_combo.currentData() or 'similarity')}) ..."
+        )
         self.step7_run_thread = QThread(self)
         self.step7_run_worker = ConfocalRigidWorker(cfg)
         self.step7_run_worker.moveToThread(self.step7_run_thread)
@@ -3768,19 +4593,30 @@ class WorkflowWindow(QWidget):
 
     def on_step7_registration_finished(self, summary: object) -> None:
         data = dict(summary) if isinstance(summary, dict) else {}
-        storyboard = Path(str(data.get("storyboard_path", ""))) if data.get("storyboard_path") else None
-        self.step7_progress_label.setText("Step 7 progress: rigid refine finished")
+        files = data.get("files") if isinstance(data.get("files"), dict) else {}
+        storyboard_ref = data.get("storyboard_path") or files.get("quick_qc_storyboard") or files.get("storyboard")
+        run_dir_ref = data.get("run_dir")
+        if not run_dir_ref and files.get("manifest"):
+            try:
+                run_dir_ref = str(Path(str(files.get("manifest"))).parent)
+            except Exception:
+                run_dir_ref = ""
+        storyboard = Path(str(storyboard_ref)) if storyboard_ref else None
+        refine_model = str(data.get("local_refine_model") or data.get("local_registration", {}).get("transform_model") or self.step7_refine_model_combo.currentData() or "similarity")
+        self.step7_progress_label.setText(f"Step 7 progress: fiber registration finished ({refine_model})")
         self.step7_run_button.setEnabled(True)
         self.step7_run_worker = None
         self.step7_run_thread = None
-        self.step7_info.append(f"Rigid refine finished. run_dir={data.get('run_dir', '')}")
+        self.step7_last_run_dir = Path(run_dir_ref) if run_dir_ref else None
+        self.step7_last_run_summary_lines = self._build_step7_run_summary_lines(data)
+        self._update_step7_info_text()
         if storyboard is not None and storyboard.exists():
             pixmap = QPixmap(str(storyboard))
             if not pixmap.isNull():
                 self.step7_storyboard_label.setText("")
                 self.step7_storyboard_label.setPixmap(pixmap)
                 self.step7_storyboard_label.resize(pixmap.size())
-        self._notify_completion("Step 7 confocal rigid registration finished")
+        self._notify_completion(f"Step 7 confocal {refine_model} registration finished")
 
     def on_step7_registration_failed(self, message: str) -> None:
         self.step7_info.append(message)
@@ -3788,6 +4624,29 @@ class WorkflowWindow(QWidget):
         self.step7_run_button.setEnabled(True)
         self.step7_run_worker = None
         self.step7_run_thread = None
+
+    def export_step7_full_report(self) -> None:
+        item = self._current_step7_item()
+        if item is None:
+            QMessageBox.warning(self, "Step 7 Confocal", "Select a myelin section first.")
+            return
+        run_dir = self.step7_last_run_dir
+        if run_dir is None or not run_dir.exists():
+            run_dir = self._latest_step7_run_dir(item.label)
+        if run_dir is None or not run_dir.exists():
+            QMessageBox.warning(self, "Step 7 Confocal", "No Step 7 run found for this section yet.")
+            return
+        try:
+            summary = export_confocal_full_report(run_dir)
+        except Exception:
+            self.step7_info.append(f"Step 7 full-report export failed:\n{traceback.format_exc()}")
+            return
+        self.step7_info.append(
+            "Full report exported. "
+            f"storyboard={summary.get('full_report_storyboard', '')} | "
+            f"metrics_md={summary.get('full_metrics_report_md', '')}"
+        )
+        self.step7_progress_label.setText("Step 7 progress: full report exported")
 
     def _ensure_step4_review_status_selected(self) -> bool:
         status = str(self.step4_registration_status_combo.currentData() or "unreviewed")
