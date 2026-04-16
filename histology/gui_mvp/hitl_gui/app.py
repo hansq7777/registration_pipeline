@@ -39,7 +39,9 @@ def main() -> int:
     db_path = root / "workspace_example" / "db" / "project.sqlite"
     schema_path = root / "schema" / "histology_project_v1.sql"
     shell = build_app_shell(db_path=db_path, schema_path=schema_path)
-    shell.resize(1280, 900)
+    screen = app.primaryScreen()
+    if screen is not None:
+        shell.setGeometry(screen.availableGeometry())
     shell.show()
     return app.exec()
 

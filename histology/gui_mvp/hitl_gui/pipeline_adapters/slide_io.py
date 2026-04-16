@@ -429,6 +429,49 @@ def load_slide_bundle(slide_path: Path, stain: str) -> LoadedSlide:
     return loaded
 
 
+def load_slide_header_only(slide_path: Path, stain: str) -> LoadedSlide:
+    if openslide is not None:
+        slide = openslide.OpenSlide(str(slide_path))
+        try:
+            mpp_x = None
+            mpp_y = None
+            objective_power = None
+            try:
+                if "openslide.mpp-x" in slide.properties:
+                    mpp_x = float(slide.properties["openslide.mpp-x"])
+                if "openslide.mpp-y" in slide.properties:
+                    mpp_y = float(slide.properties["openslide.mpp-y"])
+                if "openslide.objective-power" in slide.properties:
+                    objective_power = float(slide.properties["openslide.objective-power"])
+            except Exception:
+                mpp_x = None
+                mpp_y = None
+                objective_power = None
+            overview_level = slide.level_count - 1
+            overview_size = slide.level_dimensions[overview_level]
+            return LoadedSlide(
+                slide_path=slide_path,
+                slide_name=slide_path.name,
+                stain=stain,
+                expected_labels=[],
+                label_preview=Image.new("RGB", (1, 1), (0, 0, 0)),
+                overview=Image.new("RGB", overview_size, (0, 0, 0)),
+                proposals=[],
+                level_count=slide.level_count,
+                overview_level=overview_level,
+                overview_size=overview_size,
+                level_dimensions=tuple(slide.level_dimensions),
+                level_downsamples=tuple(float(x) for x in slide.level_downsamples),
+                backend="openslide",
+                mpp_x=mpp_x,
+                mpp_y=mpp_y,
+                objective_power=objective_power,
+            )
+        finally:
+            slide.close()
+    return load_slide_bundle(slide_path, stain)
+
+
 def _overview_bbox_with_pad(
     loaded_slide: LoadedSlide,
     proposal,
@@ -484,6 +527,101 @@ def extract_crop_from_handle(slide_handle, loaded_slide: LoadedSlide, proposal, 
     out_w = max(1, int(round(w0 / downsample)))
     out_h = max(1, int(round(h0 / downsample)))
     return np.asarray(slide_handle.read_region((x0, y0), crop_level, (out_w, out_h)).convert("RGB"))
+
+
+def _clamp_level0_bbox(
+    loaded_slide: LoadedSlide,
+    bbox_level0_xywh: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    full_w = int(loaded_slide.level_dimensions[0][0])
+    full_h = int(loaded_slide.level_dimensions[0][1])
+    x0, y0, w0, h0 = [int(v) for v in bbox_level0_xywh]
+    x0 = max(0, min(full_w - 1, x0))
+    y0 = max(0, min(full_h - 1, y0))
+    x1 = max(x0 + 1, min(full_w, x0 + max(1, w0)))
+    y1 = max(y0 + 1, min(full_h, y0 + max(1, h0)))
+    return x0, y0, int(x1 - x0), int(y1 - y0)
+
+
+def _extract_level0_bbox_with_tifffile(
+    loaded_slide: LoadedSlide,
+    bbox_level0_xywh: tuple[int, int, int, int],
+    *,
+    level: int,
+) -> np.ndarray:
+    if tifffile is None or zarr is None:
+        raise RuntimeError("tifffile fallback requires both tifffile and zarr")
+    if (
+        loaded_slide.tifffile_midres_page_index is None
+        or loaded_slide.tifffile_midres_downsample is None
+        or loaded_slide.tifffile_overview_scale_from_midres is None
+    ):
+        raise RuntimeError("Missing tifffile fallback metadata")
+
+    level = max(0, min(int(level), loaded_slide.level_count - 1))
+    x0, y0, w0, h0 = _clamp_level0_bbox(loaded_slide, bbox_level0_xywh)
+    target_downsample = float(loaded_slide.level_downsamples[level])
+    midres_downsample = float(loaded_slide.tifffile_midres_downsample)
+
+    with tifffile.TiffFile(str(loaded_slide.slide_path)) as tf:
+        if target_downsample >= midres_downsample:
+            arr = zarr.open(tf.pages[loaded_slide.tifffile_midres_page_index].aszarr(), mode="r")
+            scale = 1.0 / max(midres_downsample, 1e-6)
+            mx1 = max(0, min(arr.shape[1] - 1, int(round(x0 * scale))))
+            my1 = max(0, min(arr.shape[0] - 1, int(round(y0 * scale))))
+            mx2 = max(mx1 + 1, min(arr.shape[1], int(round((x0 + w0) * scale))))
+            my2 = max(my1 + 1, min(arr.shape[0], int(round((y0 + h0) * scale))))
+            crop = np.asarray(arr[my1:my2, mx1:mx2, :], dtype=np.uint8)
+            if target_downsample > midres_downsample:
+                out_w = max(1, int(round(w0 / target_downsample)))
+                out_h = max(1, int(round(h0 / target_downsample)))
+                crop = cv2.resize(crop, (out_w, out_h), interpolation=cv2.INTER_AREA)
+            return crop
+
+        page0 = tf.pages[0]
+        arr0 = zarr.open(page0.aszarr(), mode="r")
+        px1 = max(0, min(int(page0.shape[1]) - 1, x0))
+        py1 = max(0, min(int(page0.shape[0]) - 1, y0))
+        px2 = max(px1 + 1, min(int(page0.shape[1]), x0 + w0))
+        py2 = max(py1 + 1, min(int(page0.shape[0]), y0 + h0))
+        crop0 = np.asarray(arr0[py1:py2, px1:px2, :], dtype=np.uint8)
+        out_w = max(1, int(round(w0 / target_downsample)))
+        out_h = max(1, int(round(h0 / target_downsample)))
+        return cv2.resize(crop0, (out_w, out_h), interpolation=cv2.INTER_AREA)
+
+
+def _extract_level0_bbox_with_tifffile_handle(
+    handle: _TiffFileProxyHandle,
+    loaded_slide: LoadedSlide,
+    bbox_level0_xywh: tuple[int, int, int, int],
+    *,
+    level: int,
+) -> np.ndarray:
+    level = max(0, min(int(level), loaded_slide.level_count - 1))
+    x0, y0, w0, h0 = _clamp_level0_bbox(loaded_slide, bbox_level0_xywh)
+    target_downsample = float(loaded_slide.level_downsamples[level])
+
+    if target_downsample >= handle.midres_downsample:
+        scale = 1.0 / max(handle.midres_downsample, 1e-6)
+        mx1 = max(0, min(handle.midres_arr.shape[1] - 1, int(round(x0 * scale))))
+        my1 = max(0, min(handle.midres_arr.shape[0] - 1, int(round(y0 * scale))))
+        mx2 = max(mx1 + 1, min(handle.midres_arr.shape[1], int(round((x0 + w0) * scale))))
+        my2 = max(my1 + 1, min(handle.midres_arr.shape[0], int(round((y0 + h0) * scale))))
+        crop = np.asarray(handle.midres_arr[my1:my2, mx1:mx2, :], dtype=np.uint8)
+        if target_downsample > handle.midres_downsample:
+            out_w = max(1, int(round(w0 / target_downsample)))
+            out_h = max(1, int(round(h0 / target_downsample)))
+            crop = cv2.resize(crop, (out_w, out_h), interpolation=cv2.INTER_AREA)
+        return crop
+
+    px1 = max(0, min(handle.full_w - 1, x0))
+    py1 = max(0, min(handle.full_h - 1, y0))
+    px2 = max(px1 + 1, min(handle.full_w, x0 + w0))
+    py2 = max(py1 + 1, min(handle.full_h, y0 + h0))
+    crop0 = np.asarray(handle.page0_arr[py1:py2, px1:px2, :], dtype=np.uint8)
+    out_w = max(1, int(round(w0 / target_downsample)))
+    out_h = max(1, int(round(h0 / target_downsample)))
+    return cv2.resize(crop0, (out_w, out_h), interpolation=cv2.INTER_AREA)
 
 
 def _extract_crop_with_tifffile(loaded_slide: LoadedSlide, proposal, crop_level: int = 4) -> np.ndarray:
@@ -586,6 +724,42 @@ def extract_crop_for_preview(loaded_slide: LoadedSlide, proposal, crop_level: in
     slide = openslide.OpenSlide(str(loaded_slide.slide_path))
     try:
         return extract_crop_from_handle(slide, loaded_slide, proposal, crop_level=crop_level)
+    finally:
+        slide.close()
+
+
+def extract_level0_bbox_rgb(
+    loaded_slide: LoadedSlide,
+    bbox_level0_xywh: tuple[int, int, int, int],
+    *,
+    level: int = 0,
+    slide_handle=None,
+) -> np.ndarray:
+    level = max(0, min(int(level), loaded_slide.level_count - 1))
+    if loaded_slide.backend == "tifffile_proxy":
+        if isinstance(slide_handle, _TiffFileProxyHandle):
+            return _extract_level0_bbox_with_tifffile_handle(
+                slide_handle,
+                loaded_slide,
+                bbox_level0_xywh,
+                level=level,
+            )
+        return _extract_level0_bbox_with_tifffile(loaded_slide, bbox_level0_xywh, level=level)
+    if slide_handle is not None:
+        x0, y0, w0, h0 = _clamp_level0_bbox(loaded_slide, bbox_level0_xywh)
+        downsample = float(slide_handle.level_downsamples[level])
+        out_w = max(1, int(round(w0 / downsample)))
+        out_h = max(1, int(round(h0 / downsample)))
+        return np.asarray(slide_handle.read_region((x0, y0), level, (out_w, out_h)).convert("RGB"))
+    if openslide is None:
+        raise RuntimeError("openslide is not available in the current Python environment")
+    slide = openslide.OpenSlide(str(loaded_slide.slide_path))
+    try:
+        x0, y0, w0, h0 = _clamp_level0_bbox(loaded_slide, bbox_level0_xywh)
+        downsample = float(slide.level_downsamples[level])
+        out_w = max(1, int(round(w0 / downsample)))
+        out_h = max(1, int(round(h0 / downsample)))
+        return np.asarray(slide.read_region((x0, y0), level, (out_w, out_h)).convert("RGB"))
     finally:
         slide.close()
 

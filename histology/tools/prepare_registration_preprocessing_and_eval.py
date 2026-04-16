@@ -17,6 +17,8 @@ if str(REPO_HISTOLOGY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_HISTOLOGY_ROOT))
 
 from gui_mvp.hitl_gui.application.pair_registration import (  # noqa: E402
+    ANTS_REGISTRATION_BACKEND,
+    MASK_SHAPE_REGISTRATION_BACKEND,
     PairRegistrationConfig,
     _ants_apply,
     _common_canvas_for_pair,
@@ -26,6 +28,7 @@ from gui_mvp.hitl_gui.application.pair_registration import (  # noqa: E402
     _stage_command,
     _stage_transforms,
     _write_coord_images,
+    compute_monotonic_gating_summary,
     compute_registration_metrics,
     default_pair_registration_runs_root,
     find_ants_bin,
@@ -34,6 +37,9 @@ from gui_mvp.hitl_gui.application.pair_registration import (  # noqa: E402
     overlay_preview,
     read_nifti_2d,
     render_storyboard,
+    run_mask_shape_stage,
+    stage_display_name,
+    stage_order_for_backend,
     write_nifti_2d,
 )
 from gui_mvp.hitl_gui.application.pair_workspace import load_pair_registry  # noqa: E402
@@ -44,6 +50,8 @@ DEFAULT_NISSL_ROOT = Path(r"/mnt/d/Research/Image Analysis/Nanozoomer scans/2025
 PAIR_MASKS_ROOT = Path(r"/mnt/d/Research/Image Analysis/Nanozoomer scans/histology_pair_registration_masks_20260324")
 RUNS_ROOT = Path(r"/mnt/d/Research/Image Analysis/Nanozoomer scans/histology_pair_registration_runs")
 STORYBOARD_COL_TITLES = ("Moving", "Fixed", "Overlay", "Warp Field")
+REGISTRATION_BACKEND = ANTS_REGISTRATION_BACKEND
+MASK_SIMILARITY_SCALE_PERCENT = 5.0
 
 VARIANTS = ("baseline", "clip", "clip_norm", "clip_norm_clahe")
 EXPERIMENT_CASES = [
@@ -156,9 +164,12 @@ def _base_cfg(pair_key: str, review: dict[str, Any]) -> PairRegistrationConfig:
     runs_root = default_pair_registration_runs_root(DEFAULT_MYELIN_ROOT, DEFAULT_NISSL_ROOT)
     if runs_root is None:
         raise RuntimeError("Failed to resolve runs root.")
-    ants_bin = find_ants_bin()
-    if ants_bin is None:
+    ants_bin = find_ants_bin() if REGISTRATION_BACKEND == ANTS_REGISTRATION_BACKEND else Path(".")
+    if REGISTRATION_BACKEND == ANTS_REGISTRATION_BACKEND and ants_bin is None:
         raise RuntimeError("ANTs not found.")
+    run_stages = stage_order_for_backend(REGISTRATION_BACKEND)
+    if REGISTRATION_BACKEND == ANTS_REGISTRATION_BACKEND:
+        run_stages = run_stages[:2]
     return PairRegistrationConfig(
         pair_key=pair_key,
         moving_side="myelin",
@@ -173,8 +184,10 @@ def _base_cfg(pair_key: str, review: dict[str, Any]) -> PairRegistrationConfig:
         runs_root=runs_root,
         target_um_per_px=10.0,
         registration_mask_mode="union",
-        run_stages=("rigid", "affine"),
+        registration_backend=REGISTRATION_BACKEND,
+        run_stages=tuple(run_stages),
         affine_profile="current",
+        mask_similarity_scale_percent=float(MASK_SIMILARITY_SCALE_PERCENT),
     )
 
 
@@ -237,6 +250,7 @@ def _run_registration_variant(
     variant: str,
 ) -> dict[str, Any]:
     cfg = _base_cfg(pair_key, review)
+    registration_backend = str(cfg.registration_backend).strip().lower() or ANTS_REGISTRATION_BACKEND
     ants_bin = cfg.ants_bin
     fixed_rgb, fixed_labels, moving_rgb, moving_labels = _prepare_pair_group(pair_key, review, group)
     fixed_gray_u8, fixed_labels = preprocess_gray_variant(fixed_rgb, fixed_labels, variant)
@@ -258,15 +272,22 @@ def _run_registration_variant(
     cv2.imwrite(str(inputs_dir / "fixed_mask_labels.png"), fixed_labels)
     cv2.imwrite(str(inputs_dir / "moving_mask_labels.png"), moving_labels)
 
-    fixed_img_path = inputs_dir / "fixed_gray.nii.gz"
-    moving_img_path = inputs_dir / "moving_gray.nii.gz"
-    fixed_mask_path = inputs_dir / "fixed_mask.nii.gz"
-    moving_mask_path = inputs_dir / "moving_mask.nii.gz"
-    write_nifti_2d(fixed_img_path, fixed_gray)
-    write_nifti_2d(moving_img_path, moving_gray)
-    write_nifti_2d(fixed_mask_path, fixed_mask)
-    write_nifti_2d(moving_mask_path, moving_mask)
-    moving_coord_x, moving_coord_y = _write_coord_images(inputs_dir, moving_gray.shape[:2])
+    fixed_img_path: Path | None = None
+    moving_img_path: Path | None = None
+    fixed_mask_path: Path | None = None
+    moving_mask_path: Path | None = None
+    moving_coord_x: Path | None = None
+    moving_coord_y: Path | None = None
+    if registration_backend == ANTS_REGISTRATION_BACKEND:
+        fixed_img_path = inputs_dir / "fixed_gray.nii.gz"
+        moving_img_path = inputs_dir / "moving_gray.nii.gz"
+        fixed_mask_path = inputs_dir / "fixed_mask.nii.gz"
+        moving_mask_path = inputs_dir / "moving_mask.nii.gz"
+        write_nifti_2d(fixed_img_path, fixed_gray)
+        write_nifti_2d(moving_img_path, moving_gray)
+        write_nifti_2d(fixed_mask_path, fixed_mask)
+        write_nifti_2d(moving_mask_path, moving_mask)
+        moving_coord_x, moving_coord_y = _write_coord_images(inputs_dir, moving_gray.shape[:2])
 
     input_metrics, input_metric_timing = compute_registration_metrics(fixed_gray, moving_gray, fixed_mask, moving_mask)
     input_note = metrics_note(input_metrics, input_metric_timing, f"{variant} before registration")
@@ -287,6 +308,7 @@ def _run_registration_variant(
         storyboard_path,
     )
 
+    requested_stages = tuple(str(x).strip().lower() for x in cfg.run_stages)
     rigid_mat = stages_dir / "rigid" / "rigid_0GenericAffine.mat"
     affine_mat = stages_dir / "affine" / "affine_0GenericAffine.mat"
     manifest: dict[str, Any] = {
@@ -297,10 +319,12 @@ def _run_registration_variant(
         "fixed_side": "nissl",
         "moving_group": group,
         "fixed_group": group,
+        "registration_backend": registration_backend,
         "target_um_per_px": 10.0,
         "registration_mask_mode": "union",
-        "run_stages": ["rigid", "affine"],
+        "run_stages": list(requested_stages),
         "affine_profile": "current",
+        "mask_similarity_scale_percent": float(cfg.mask_similarity_scale_percent),
         "inputs": {
             "fixed_gray_png": str(inputs_dir / "fixed_gray.png"),
             "moving_gray_png": str(inputs_dir / "moving_gray.png"),
@@ -310,76 +334,134 @@ def _run_registration_variant(
         "timing_seconds": {},
         "stages": {},
     }
+    if registration_backend == ANTS_REGISTRATION_BACKEND:
+        manifest["inputs"].update(
+            {
+                "fixed_gray": str(fixed_img_path),
+                "moving_gray": str(moving_img_path),
+                "fixed_mask": str(fixed_mask_path),
+                "moving_mask": str(moving_mask_path),
+            }
+        )
 
     total_t0 = time.perf_counter()
-    for stage, init_tfms, progress_percent in (
-        ("rigid", [], 50),
-        ("affine", [rigid_mat], 100),
-    ):
-        stage_t0 = time.perf_counter()
+    if registration_backend == ANTS_REGISTRATION_BACKEND:
+        stage_plan: list[tuple[str, Any]] = [("rigid", []), ("affine", [rigid_mat])]
+        stage_plan = [row for row in stage_plan if row[0] in requested_stages]
+    else:
+        stage_plan = [(stage, None) for stage in requested_stages]
+    mask_stage_params: dict[str, dict[str, float]] = {}
+    for stage, init_spec in stage_plan:
         stage_dir = stages_dir / stage
         stage_dir.mkdir(parents=True, exist_ok=True)
-        prefix = stage_dir / f"{stage}_"
-        cmd = _stage_command(
-            ants_bin,
-            stage,
-            fixed_img_path,
-            moving_img_path,
-            fixed_mask_path,
-            moving_mask_path,
-            prefix,
-            init_tfms,
-            "current",
-        )
-        ants_t0 = time.perf_counter()
-        _run_logged(cmd, stage_dir / f"{stage}.log")
-        ants_seconds = float(time.perf_counter() - ants_t0)
-
-        warped_img_path = stage_dir / f"{stage}_Warped.nii.gz"
-        tfms = _stage_transforms(stage_dir, stage, rigid_mat, affine_mat)
-        warped_mask_path = stage_dir / f"{stage}_warped_mask.nii.gz"
-        _ants_apply(
-            ants_bin,
-            moving_mask_path,
-            fixed_img_path,
-            warped_mask_path,
-            tfms,
-            interpolation="NearestNeighbor",
-            log_path=stage_dir / f"{stage}_warp_mask.log",
-        )
-        warped_gray = read_nifti_2d(warped_img_path)
-        warped_mask = read_nifti_2d(warped_mask_path)
-        stage_metrics, stage_metric_timing = compute_registration_metrics(
-            fixed_gray,
-            np.clip(warped_gray, 0.0, 1.0),
-            fixed_mask,
-            (warped_mask > 0.5).astype(np.float32),
-        )
-        overlay = overlay_preview(
-            fixed_gray,
-            np.clip(warped_gray, 0.0, 1.0),
-            fixed_mask,
-            (warped_mask > 0.5).astype(np.float32),
-        )
-        heatmap_rgb, heatmap_png = _compute_stage_heatmap(
-            ants_bin,
-            stage_dir,
-            stage,
-            fixed_img_path,
-            fixed_mask,
-            moving_coord_x,
-            moving_coord_y,
-            rigid_mat,
-            affine_mat,
-            warped_mask_path,
-        )
-        stage_seconds = float(time.perf_counter() - stage_t0)
-        stage_records[stage] = {
-            "moving": gray_preview_panel(np.clip(warped_gray, 0.0, 1.0)),
-            "overlay": overlay,
-            "heatmap": heatmap_rgb,
-            "note": metrics_note(stage_metrics, stage_metric_timing, f"{variant} {stage} finished"),
-        }
+        if registration_backend == ANTS_REGISTRATION_BACKEND:
+            init_tfms = list(init_spec or [])
+            stage_t0 = time.perf_counter()
+            prefix = stage_dir / f"{stage}_"
+            cmd = _stage_command(
+                ants_bin,
+                stage,
+                fixed_img_path,
+                moving_img_path,
+                fixed_mask_path,
+                moving_mask_path,
+                prefix,
+                init_tfms,
+                "current",
+            )
+            ants_t0 = time.perf_counter()
+            _run_logged(cmd, stage_dir / f"{stage}.log")
+            ants_seconds = float(time.perf_counter() - ants_t0)
+            warped_img_path = stage_dir / f"{stage}_Warped.nii.gz"
+            tfms = _stage_transforms(stage_dir, stage, rigid_mat, affine_mat)
+            warped_mask_path = stage_dir / f"{stage}_warped_mask.nii.gz"
+            _ants_apply(
+                ants_bin,
+                moving_mask_path,
+                fixed_img_path,
+                warped_mask_path,
+                tfms,
+                interpolation="NearestNeighbor",
+                log_path=stage_dir / f"{stage}_warp_mask.log",
+            )
+            warped_gray = read_nifti_2d(warped_img_path)
+            warped_mask = read_nifti_2d(warped_mask_path)
+            stage_metrics, stage_metric_timing = compute_registration_metrics(
+                fixed_gray,
+                np.clip(warped_gray, 0.0, 1.0),
+                fixed_mask,
+                (warped_mask > 0.5).astype(np.float32),
+            )
+            overlay = overlay_preview(
+                fixed_gray,
+                np.clip(warped_gray, 0.0, 1.0),
+                fixed_mask,
+                (warped_mask > 0.5).astype(np.float32),
+            )
+            heatmap_rgb, heatmap_png = _compute_stage_heatmap(
+                ants_bin,
+                stage_dir,
+                stage,
+                fixed_img_path,
+                fixed_mask,
+                moving_coord_x,
+                moving_coord_y,
+                rigid_mat,
+                affine_mat,
+                warped_mask_path,
+            )
+            stage_seconds = float(time.perf_counter() - stage_t0)
+            stage_records[stage] = {
+                "moving": gray_preview_panel(np.clip(warped_gray, 0.0, 1.0)),
+                "overlay": overlay,
+                "heatmap": heatmap_rgb,
+                "note": metrics_note(stage_metrics, stage_metric_timing, f"{variant} {stage_display_name(stage)} finished"),
+            }
+            manifest["stages"][stage] = {
+                "backend": ANTS_REGISTRATION_BACKEND,
+                "warped_image": str(warped_img_path),
+                "warped_mask": str(warped_mask_path),
+                "heatmap_png": str(heatmap_png),
+                "metrics": stage_metrics,
+                "metric_timing_seconds": stage_metric_timing,
+                "timing_seconds": {
+                    "stage_total": stage_seconds,
+                    "ants_registration": ants_seconds,
+                    "postprocess": float(max(stage_seconds - ants_seconds, 0.0)),
+                },
+            }
+        else:
+            init_params = mask_stage_params.get("mask_rigid") if stage == "mask_similarity" else None
+            stage_result = run_mask_shape_stage(
+                stage,
+                fixed_gray,
+                moving_gray,
+                fixed_mask,
+                moving_mask,
+                stage_dir,
+                similarity_scale_percent=float(cfg.mask_similarity_scale_percent),
+                init_params=init_params,
+            )
+            mask_stage_params[stage] = dict(stage_result["transform_params"])
+            stage_records[stage] = {
+                "moving": stage_result["moving"],
+                "overlay": stage_result["overlay"],
+                "heatmap": stage_result["heatmap"],
+                "note": stage_result["note"],
+            }
+            manifest["stages"][stage] = {
+                "backend": MASK_SHAPE_REGISTRATION_BACKEND,
+                "warped_image": stage_result["warped_image"],
+                "warped_mask": stage_result["warped_mask"],
+                "heatmap_png": stage_result["heatmap_png"],
+                "metrics": dict(stage_result["metrics"]),
+                "metric_timing_seconds": dict(stage_result["metric_timing_seconds"]),
+                "timing_seconds": dict(stage_result["timing_seconds"]),
+                "optimizer": dict(stage_result["optimizer"]),
+                "transform_params": dict(stage_result["transform_params"]),
+                "transform_matrix_2x3": list(stage_result["transform_matrix_2x3"]),
+            }
+        manifest["timing_seconds"][stage] = float(manifest["stages"][stage]["timing_seconds"]["stage_total"])
         render_storyboard(
             [
                 {
@@ -393,7 +475,7 @@ def _run_registration_variant(
                 },
                 *[
                     {
-                        "label": s.capitalize(),
+                        "label": stage_display_name(s),
                         "note": stage_records[s]["note"],
                         "fixed": gray_preview_panel(fixed_gray),
                         "moving": stage_records[s]["moving"],
@@ -401,40 +483,92 @@ def _run_registration_variant(
                         "heatmap": stage_records[s]["heatmap"],
                         "col_titles": STORYBOARD_COL_TITLES,
                     }
-                    for s in ("rigid", "affine")
+                    for s in requested_stages
                     if s in stage_records
                 ],
             ],
             storyboard_path,
         )
-        manifest["stages"][stage] = {
-            "warped_image": str(warped_img_path),
-            "warped_mask": str(warped_mask_path),
-            "heatmap_png": str(heatmap_png),
-            "metrics": stage_metrics,
-            "metric_timing_seconds": stage_metric_timing,
-            "timing_seconds": {
-                "stage_total": stage_seconds,
-                "ants_registration": ants_seconds,
-                "postprocess": float(max(stage_seconds - ants_seconds, 0.0)),
+
+    gating_summary = compute_monotonic_gating_summary(manifest)
+    manifest["gating_policy"] = gating_summary["policy"]
+    manifest["gating_summary"] = {k: v for k, v in gating_summary.items() if k != "policy"}
+    manifest["best_stage"] = gating_summary["best_stage"]
+    manifest["best_metrics"] = gating_summary["best_metrics"]
+    manifest["accepted_stage_path"] = list(gating_summary["accepted_stage_path"])
+    manifest["final_delta_vs_input"] = dict(gating_summary["final_delta_vs_input"])
+    manifest["input_gate"] = gating_summary["input"]
+    for stage, gate in gating_summary["stages"].items():
+        if stage in manifest["stages"]:
+            manifest["stages"][stage]["gate"] = gate
+        if stage in stage_records:
+            stage_records[stage]["note"] = f"{stage_records[stage]['note']} | gate={'ACCEPTED' if gate['accepted'] else 'REJECTED'} vs {gate['best_stage_before']}"
+            stage_records[stage]["gate_status"] = "ACCEPTED" if gate["accepted"] else "REJECTED"
+    render_storyboard(
+        [
+            {
+                "label": "Input",
+                "note": input_note,
+                "fixed": gray_preview_panel(fixed_gray),
+                "moving": gray_preview_panel(moving_gray),
+                "overlay": overlay_preview(fixed_gray, moving_gray, fixed_mask, moving_mask),
+                "heatmap": np.full((*fixed_gray.shape, 3), 235, dtype=np.uint8),
+                "col_titles": STORYBOARD_COL_TITLES,
             },
-        }
-        manifest["timing_seconds"][stage] = stage_seconds
+            *[
+                {
+                    "label": f"{stage_display_name(s)} [{stage_records[s].get('gate_status', '')}]".rstrip(),
+                    "note": stage_records[s]["note"],
+                    "fixed": gray_preview_panel(fixed_gray),
+                    "moving": stage_records[s]["moving"],
+                    "overlay": stage_records[s]["overlay"],
+                    "heatmap": stage_records[s]["heatmap"],
+                    "col_titles": STORYBOARD_COL_TITLES,
+                }
+                for s in requested_stages
+                if s in stage_records
+            ],
+        ],
+        storyboard_path,
+    )
     manifest["timing_seconds"]["total"] = float(time.perf_counter() - total_t0)
     _write_json(run_dir / "run_manifest.json", manifest)
     return manifest
 
 
+def _best_stage(manifest: dict[str, Any]) -> str:
+    return str(manifest.get("best_stage", "input"))
+
+
+def _best_metrics(manifest: dict[str, Any]) -> dict[str, Any]:
+    best = manifest.get("best_metrics")
+    if isinstance(best, dict) and best:
+        return best
+    return dict(manifest.get("input_metrics", {}))
+
+
 def _aggregate_variant(results: list[dict[str, Any]], variant: str) -> dict[str, float]:
     rows = [row["variants"][variant] for row in results if variant in row["variants"]]
+    best_stage_counts = {"input": 0}
+    for stage in stage_order_for_backend(REGISTRATION_BACKEND):
+        best_stage_counts[str(stage)] = 0
+    for row in rows:
+        stage = _best_stage(row)
+        if stage not in best_stage_counts:
+            best_stage_counts[stage] = 0
+        best_stage_counts[stage] += 1
+    terminal_stage = str(stage_order_for_backend(REGISTRATION_BACKEND)[-1])
     return {
         "mean_total_s": round(float(statistics.mean(r["timing_seconds"]["total"] for r in rows)), 3),
-        "mean_affine_s": round(float(statistics.mean(r["timing_seconds"]["affine"] for r in rows)), 3),
+        "mean_terminal_stage_s": round(float(statistics.mean(float(r["timing_seconds"].get(terminal_stage, 0.0)) for r in rows)), 3),
         "mean_input_dice": round(float(statistics.mean(r["input_metrics"]["dice"] for r in rows)), 6),
-        "mean_affine_dice": round(float(statistics.mean(r["stages"]["affine"]["metrics"]["dice"] for r in rows)), 6),
-        "mean_affine_hd95_px": round(float(statistics.mean(r["stages"]["affine"]["metrics"]["hd95_px"] for r in rows)), 6),
-        "mean_affine_mi": round(float(statistics.mean(r["stages"]["affine"]["metrics"]["mi"] for r in rows)), 6),
-        "mean_affine_cc": round(float(statistics.mean(r["stages"]["affine"]["metrics"]["cc"] for r in rows)), 6),
+        "mean_best_dice": round(float(statistics.mean(_best_metrics(r)["dice"] for r in rows)), 6),
+        "mean_best_hd95_px": round(float(statistics.mean(_best_metrics(r)["hd95_px"] for r in rows)), 6),
+        "mean_best_mi": round(float(statistics.mean(_best_metrics(r)["mi"] for r in rows)), 6),
+        "mean_best_cc": round(float(statistics.mean(_best_metrics(r)["cc"] for r in rows)), 6),
+        "mean_best_minus_input_dice": round(float(statistics.mean(float(r["final_delta_vs_input"]["dice"]) for r in rows)), 6),
+        "mean_best_minus_input_hd95_px": round(float(statistics.mean(float(r["final_delta_vs_input"]["hd95_px"]) for r in rows)), 6),
+        **{f"best_stage_{stage}_count": int(count) for stage, count in best_stage_counts.items()},
     }
 
 
@@ -473,15 +607,16 @@ def _write_experiment_md(path: Path, payload: dict[str, Any]) -> None:
         lines.append(f"### {row['pair_key']} | group {row['group']}")
         for variant in VARIANTS:
             rec = row["variants"][variant]
-            aff = rec["stages"]["affine"]["metrics"]
+            best = _best_metrics(rec)
             lines.extend(
                 [
                     f"- {variant}:",
                     f"  - total_s: `{rec['timing_seconds']['total']:.2f}`",
-                    f"  - affine_dice: `{aff['dice']:.4f}`",
-                    f"  - affine_hd95_px: `{aff['hd95_px']:.2f}`",
-                    f"  - affine_mi: `{aff['mi']:.4f}`",
-                    f"  - affine_cc: `{aff['cc']:.4f}`",
+                    f"  - best_stage: `{_best_stage(rec)}`",
+                    f"  - best_dice: `{best['dice']:.4f}`",
+                    f"  - best_hd95_px: `{best['hd95_px']:.2f}`",
+                    f"  - best_mi: `{best['mi']:.4f}`",
+                    f"  - best_cc: `{best['cc']:.4f}`",
                 ]
             )
         lines.append("")
@@ -513,10 +648,11 @@ def main() -> int:
         for variant in VARIANTS:
             manifest = _run_registration_variant(pair_key, review, group, variant)
             row["variants"][variant] = manifest
-            aff = manifest["stages"]["affine"]["metrics"]
+            best = _best_metrics(manifest)
             print(
                 f"  {variant}: total={manifest['timing_seconds']['total']:.1f}s "
-                f"dice={aff['dice']:.4f} hd95={aff['hd95_px']:.2f} mi={aff['mi']:.4f} cc={aff['cc']:.4f}",
+                f"best_stage={_best_stage(manifest)} "
+                f"dice={best['dice']:.4f} hd95={best['hd95_px']:.2f} mi={best['mi']:.4f} cc={best['cc']:.4f}",
                 flush=True,
             )
         payload["results"].append(row)
@@ -528,10 +664,10 @@ def main() -> int:
     for variant in ("clip", "clip_norm", "clip_norm_clahe"):
         stats = payload["aggregate"][variant]
         conclusions.append(
-            f"{variant}: Dice delta vs baseline = {stats['mean_affine_dice'] - baseline['mean_affine_dice']:+.6f}, "
-            f"HD95 delta = {stats['mean_affine_hd95_px'] - baseline['mean_affine_hd95_px']:+.6f}, "
-            f"MI delta = {stats['mean_affine_mi'] - baseline['mean_affine_mi']:+.6f}, "
-            f"CC delta = {stats['mean_affine_cc'] - baseline['mean_affine_cc']:+.6f}."
+            f"{variant}: best Dice delta vs baseline = {stats['mean_best_dice'] - baseline['mean_best_dice']:+.6f}, "
+            f"best HD95 delta = {stats['mean_best_hd95_px'] - baseline['mean_best_hd95_px']:+.6f}, "
+            f"best MI delta = {stats['mean_best_mi'] - baseline['mean_best_mi']:+.6f}, "
+            f"best CC delta = {stats['mean_best_cc'] - baseline['mean_best_cc']:+.6f}."
         )
     payload["conclusions"] = conclusions
     payload["completed_at_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")

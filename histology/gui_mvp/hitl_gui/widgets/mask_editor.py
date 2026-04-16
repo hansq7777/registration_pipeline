@@ -5,11 +5,15 @@ from typing import Callable, Optional
 import cv2
 import numpy as np
 from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt
-from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPaintEvent, QPixmap, QWheelEvent
+from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPaintEvent, QPen, QPixmap, QWheelEvent
 from PySide6.QtWidgets import QWidget
 from scipy.ndimage import binary_fill_holes
 
 from .graphics import qimage_from_rgb_array, qimage_from_rgba_array
+
+
+MASK_EDITOR_MIN_ZOOM_FACTOR = 0.25
+MASK_EDITOR_MAX_ZOOM_FACTOR = 128.0
 
 
 class MaskEditorLabel(QWidget):
@@ -24,6 +28,8 @@ class MaskEditorLabel(QWidget):
         self.artifact_mask_display: Optional[np.ndarray] = None
 
         self.base_pixmap: Optional[QPixmap] = None
+        self.detail_patch_full_rect_xywh: Optional[tuple[int, int, int, int]] = None
+        self.detail_patch_pixmap: Optional[QPixmap] = None
         self.overlay_rgba_display: Optional[np.ndarray] = None
         self.overlay_pixmap: Optional[QPixmap] = None
         self.aux_overlay_rgba_display: Optional[np.ndarray] = None
@@ -37,16 +43,22 @@ class MaskEditorLabel(QWidget):
         self.mirror_enabled: bool = False
         self.raw_visible: bool = True
         self.overlay_visible: bool = True
+        self.editing_enabled: bool = True
         self.brush_enabled: bool = False
+        self.primary_stroke_add_mode: bool = True
         self._hand_override_active: bool = False
         self._brush_enabled_before_hand_override: Optional[bool] = None
         self._line_erase_active: bool = False
         self._brush_enabled_before_line_erase: Optional[bool] = None
         self._line_erase_start_display: Optional[tuple[int, int]] = None
         self._line_erase_preview_end_display: Optional[tuple[int, int]] = None
+        self._polygon_active: bool = False
+        self._polygon_points_display: list[tuple[int, int]] = []
+        self._polygon_preview_end_display: Optional[tuple[int, int]] = None
         self.display_scale: float = 1.0
         self.view_scale: float = 1.0
         self.zoom_factor: float = 1.0
+        self.full_resolution_render_enabled: bool = False
         self.pan_offset = QPointF(0.0, 0.0)
         self._image_draw_rect = QRectF()
 
@@ -54,11 +66,14 @@ class MaskEditorLabel(QWidget):
         self.on_mask_changed: Optional[Callable[[], None]] = None
         self.on_painting_state_changed: Optional[Callable[[bool], None]] = None
         self.on_active_layer_changed: Optional[Callable[[str], None]] = None
+        self.on_tool_mode_changed: Optional[Callable[[str], None]] = None
         self.on_close_fill_requested: Optional[Callable[[], None]] = None
         self.on_save_and_next_requested: Optional[Callable[[], None]] = None
         self.on_focus_gained: Optional[Callable[[], None]] = None
         self.on_mark_group_requested: Optional[Callable[[int], None]] = None
+        self.on_view_changed: Optional[Callable[[dict[str, object]], None]] = None
         self.component_group_marks: dict[int, int] = {}
+        self._last_view_signature: tuple[object, ...] | None = None
 
         self._painting = False
         self._panning = False
@@ -76,7 +91,16 @@ class MaskEditorLabel(QWidget):
         self.setAutoFillBackground(False)
         self._update_cursor()
 
-    def set_section(self, raw_rgb: np.ndarray, tissue_mask: np.ndarray, artifact_mask: np.ndarray) -> None:
+    def set_section(
+        self,
+        raw_rgb: np.ndarray,
+        tissue_mask: np.ndarray,
+        artifact_mask: np.ndarray,
+        *,
+        preserve_view: bool = False,
+    ) -> None:
+        prev_zoom = float(self.zoom_factor)
+        prev_pan = QPointF(self.pan_offset)
         self.raw_rgb_full = raw_rgb.copy()
         self.tissue_mask_full = tissue_mask.copy()
         self.artifact_mask_full = artifact_mask.copy()
@@ -85,19 +109,93 @@ class MaskEditorLabel(QWidget):
         self._stroke_points_display = []
         self._stroke_dirty_display_rect = None
         self._undo_stack = []
+        self._polygon_points_display = []
+        self._polygon_preview_end_display = None
         self.component_group_marks = {}
         self.aux_overlay_rgba_display = None
         self.aux_overlay_pixmap = None
-        self.zoom_factor = 1.0
-        self.pan_offset = QPointF(0.0, 0.0)
+        self.detail_patch_full_rect_xywh = None
+        self.detail_patch_pixmap = None
+        self._last_view_signature = None
+        if preserve_view:
+            self.zoom_factor = float(np.clip(prev_zoom, MASK_EDITOR_MIN_ZOOM_FACTOR, MASK_EDITOR_MAX_ZOOM_FACTOR))
+            self.pan_offset = QPointF(prev_pan)
+        else:
+            self.zoom_factor = 1.0
+            self.pan_offset = QPointF(0.0, 0.0)
         self._rebuild_display_buffers()
         self._update_cursor()
+        self.refresh()
+
+    def reset_view(self) -> None:
+        self.zoom_factor = 1.0
+        self.pan_offset = QPointF(0.0, 0.0)
+        self.refresh()
+
+    def zoom_by(self, factor: float) -> None:
+        if factor <= 0.0 or self.raw_rgb_display is None:
+            return
+        old_rect = QRectF(self._image_draw_rect)
+        old_zoom = float(self.zoom_factor)
+        new_zoom = float(np.clip(self.zoom_factor * factor, MASK_EDITOR_MIN_ZOOM_FACTOR, MASK_EDITOR_MAX_ZOOM_FACTOR))
+        if abs(new_zoom - old_zoom) < 1e-9:
+            return
+        anchor = QPointF(self.width() / 2.0, self.height() / 2.0)
+        self.zoom_factor = new_zoom
+        self._update_draw_rect()
+        new_rect = QRectF(self._image_draw_rect)
+        if not old_rect.isNull() and not new_rect.isNull():
+            rel_x = (anchor.x() - old_rect.x()) / max(1e-6, old_rect.width())
+            rel_y = (anchor.y() - old_rect.y()) / max(1e-6, old_rect.height())
+            rel_x = float(np.clip(rel_x, 0.0, 1.0))
+            rel_y = float(np.clip(rel_y, 0.0, 1.0))
+            target_x = new_rect.x() + rel_x * new_rect.width()
+            target_y = new_rect.y() + rel_y * new_rect.height()
+            self.pan_offset = QPointF(
+                self.pan_offset.x() + (anchor.x() - target_x),
+                self.pan_offset.y() + (anchor.y() - target_y),
+            )
         self.refresh()
 
     def set_active_layer(self, layer: str) -> None:
         if layer not in {"tissue", "artifact"}:
             return
         self.active_layer = layer
+        self.refresh()
+
+    def set_full_resolution_render_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if self.full_resolution_render_enabled == enabled:
+            return
+        self.full_resolution_render_enabled = enabled
+        if self.raw_rgb_full is None:
+            self.refresh()
+            return
+        self._rebuild_display_buffers()
+        self.refresh()
+
+    def set_detail_patch(
+        self,
+        patch_rgb: np.ndarray | None,
+        *,
+        full_rect_xywh: tuple[int, int, int, int] | None = None,
+    ) -> None:
+        if patch_rgb is None or full_rect_xywh is None:
+            self.detail_patch_full_rect_xywh = None
+            self.detail_patch_pixmap = None
+            self.refresh()
+            return
+        patch = np.asarray(patch_rgb, dtype=np.uint8)
+        if patch.ndim != 3 or patch.shape[2] != 3:
+            raise ValueError("detail patch must be an HxWx3 RGB array")
+        h, w = patch.shape[:2]
+        if h <= 0 or w <= 0:
+            self.detail_patch_full_rect_xywh = None
+            self.detail_patch_pixmap = None
+            self.refresh()
+            return
+        self.detail_patch_full_rect_xywh = tuple(int(v) for v in full_rect_xywh)
+        self.detail_patch_pixmap = QPixmap.fromImage(qimage_from_rgb_array(patch))
         self.refresh()
 
     def set_aux_overlay_rgba(self, overlay_rgba: np.ndarray | None) -> None:
@@ -122,6 +220,94 @@ class MaskEditorLabel(QWidget):
         self.brush_radius = max(1, radius)
         self._update_widget_rect(old_rect.united(self._hover_widget_rect()))
 
+    def set_editing_enabled(self, enabled: bool) -> None:
+        self.editing_enabled = bool(enabled)
+        if not self.editing_enabled:
+            self._polygon_active = False
+            self._polygon_points_display = []
+            self._polygon_preview_end_display = None
+            self._line_erase_active = False
+            self._line_erase_start_display = None
+            self._line_erase_preview_end_display = None
+            self._hand_override_active = False
+            self._brush_enabled_before_hand_override = None
+            self._brush_enabled_before_line_erase = None
+            self._set_brush_enabled(False)
+        self._emit_tool_mode_changed()
+        self._update_cursor()
+        self.refresh()
+
+    def current_tool_mode(self) -> str:
+        if self._polygon_active:
+            return "polygon"
+        if self._line_erase_active:
+            return "line_erase"
+        if self.brush_enabled:
+            return "brush" if self.primary_stroke_add_mode else "eraser"
+        return "grab"
+
+    def _emit_tool_mode_changed(self) -> None:
+        if self.on_tool_mode_changed is not None:
+            self.on_tool_mode_changed(self.current_tool_mode())
+
+    def set_on_tool_mode_changed(self, callback: Callable[[str], None]) -> None:
+        self.on_tool_mode_changed = callback
+
+    def activate_hand_tool(self) -> None:
+        self._polygon_active = False
+        self._polygon_points_display = []
+        self._polygon_preview_end_display = None
+        self._line_erase_active = False
+        self._line_erase_start_display = None
+        self._line_erase_preview_end_display = None
+        self._hand_override_active = False
+        self._brush_enabled_before_hand_override = None
+        self._brush_enabled_before_line_erase = None
+        self._set_brush_enabled(False)
+        self._emit_tool_mode_changed()
+        self._update_cursor()
+        self.refresh()
+
+    def activate_brush_tool(self, *, add: bool = True) -> None:
+        if not self.editing_enabled:
+            return
+        self.primary_stroke_add_mode = bool(add)
+        self._polygon_active = False
+        self._polygon_points_display = []
+        self._polygon_preview_end_display = None
+        self._line_erase_active = False
+        self._line_erase_start_display = None
+        self._line_erase_preview_end_display = None
+        self._hand_override_active = False
+        self._brush_enabled_before_hand_override = None
+        self._brush_enabled_before_line_erase = None
+        self._set_brush_enabled(True)
+        self._emit_tool_mode_changed()
+        self._update_cursor()
+        self.refresh()
+
+    def activate_polygon_tool(self) -> None:
+        if not self.editing_enabled:
+            return
+        self._polygon_active = True
+        self._polygon_points_display = []
+        self._polygon_preview_end_display = None
+        self._line_erase_active = False
+        self._line_erase_start_display = None
+        self._line_erase_preview_end_display = None
+        self._hand_override_active = False
+        self._brush_enabled_before_hand_override = None
+        self._brush_enabled_before_line_erase = None
+        self._set_brush_enabled(False)
+        self._emit_tool_mode_changed()
+        self._update_cursor()
+        self.refresh()
+
+    def clear_polygon(self) -> None:
+        self._polygon_points_display = []
+        self._polygon_preview_end_display = None
+        self.refresh()
+
     def toggle_overlay_visibility(self) -> bool:
         self.overlay_visible = not self.overlay_visible
         self.refresh()
@@ -133,13 +319,20 @@ class MaskEditorLabel(QWidget):
         return self.raw_visible
 
     def toggle_brush_mode(self) -> bool:
+        if not self.editing_enabled:
+            return False
         self._hand_override_active = False
         self._brush_enabled_before_hand_override = None
         self._line_erase_active = False
         self._brush_enabled_before_line_erase = None
         self._line_erase_start_display = None
         self._line_erase_preview_end_display = None
+        self._polygon_active = False
+        self._polygon_points_display = []
+        self._polygon_preview_end_display = None
+        self.primary_stroke_add_mode = True
         self._set_brush_enabled(not self.brush_enabled)
+        self._emit_tool_mode_changed()
         return self.brush_enabled
 
     def _set_brush_enabled(self, enabled: bool) -> None:
@@ -159,8 +352,14 @@ class MaskEditorLabel(QWidget):
         if self._panning:
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             return
+        if self._polygon_active:
+            self.setCursor(Qt.CursorShape.CrossCursor)
+            return
         if self._line_erase_active:
             self.setCursor(Qt.CursorShape.CrossCursor)
+            return
+        if not self.editing_enabled:
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
             return
         if self.brush_enabled:
             self.setCursor(Qt.CursorShape.CrossCursor)
@@ -168,12 +367,19 @@ class MaskEditorLabel(QWidget):
         self.setCursor(Qt.CursorShape.OpenHandCursor)
 
     def toggle_hand_override(self) -> bool:
+        if not self.editing_enabled:
+            self._update_cursor()
+            self.refresh()
+            return True
         if self._line_erase_active:
             self._line_erase_active = False
             self._brush_enabled_before_line_erase = None
             self._line_erase_start_display = None
             self._line_erase_preview_end_display = None
             self._update_cursor()
+        self._polygon_active = False
+        self._polygon_points_display = []
+        self._polygon_preview_end_display = None
         if self._hand_override_active:
             self._hand_override_active = False
             restore_brush = self._brush_enabled_before_hand_override
@@ -182,20 +388,25 @@ class MaskEditorLabel(QWidget):
                 self._set_brush_enabled(True)
             else:
                 self._update_cursor()
+            self._emit_tool_mode_changed()
             self.refresh()
             return not self.brush_enabled
 
         if not self.brush_enabled:
             self._update_cursor()
+            self._emit_tool_mode_changed()
             self.refresh()
             return True
 
         self._brush_enabled_before_hand_override = self.brush_enabled
         self._hand_override_active = True
         self._set_brush_enabled(False)
+        self._emit_tool_mode_changed()
         return True
 
     def toggle_line_erase_mode(self) -> bool:
+        if not self.editing_enabled:
+            return False
         if self._line_erase_active:
             self._line_erase_active = False
             self._brush_enabled_before_line_erase = None
@@ -203,17 +414,22 @@ class MaskEditorLabel(QWidget):
             self._line_erase_preview_end_display = None
             self._set_brush_enabled(False)
             self._update_cursor()
+            self._emit_tool_mode_changed()
             self.refresh()
             return False
 
         self._brush_enabled_before_line_erase = None
         self._hand_override_active = False
         self._brush_enabled_before_hand_override = None
+        self._polygon_active = False
+        self._polygon_points_display = []
+        self._polygon_preview_end_display = None
         self._set_brush_enabled(False)
         self._line_erase_active = True
         self._line_erase_start_display = None
         self._line_erase_preview_end_display = None
         self._update_cursor()
+        self._emit_tool_mode_changed()
         self.refresh()
         return True
 
@@ -355,6 +571,9 @@ class MaskEditorLabel(QWidget):
     def set_on_mark_group_requested(self, callback: Callable[[int], None]) -> None:
         self.on_mark_group_requested = callback
 
+    def set_on_view_changed(self, callback: Callable[[dict[str, object]], None]) -> None:
+        self.on_view_changed = callback
+
     def set_component_group_marks(self, marks: dict[int, int]) -> None:
         self.component_group_marks = {
             int(rank): int(group)
@@ -369,6 +588,8 @@ class MaskEditorLabel(QWidget):
             self.tissue_mask_display = None
             self.artifact_mask_display = None
             self.base_pixmap = None
+            self.detail_patch_full_rect_xywh = None
+            self.detail_patch_pixmap = None
             self.overlay_rgba_display = None
             self.overlay_pixmap = None
             self.aux_overlay_rgba_display = None
@@ -376,22 +597,29 @@ class MaskEditorLabel(QWidget):
             self.stroke_mask_display = None
             self.stroke_rgba_display = None
             self.stroke_pixmap = None
+            self._last_view_signature = None
             return
 
         h, w = self.raw_rgb_full.shape[:2]
-        max_dim = 1400
-        self.display_scale = min(1.0, max_dim / max(h, w))
-        dw = max(1, int(round(w * self.display_scale)))
-        dh = max(1, int(round(h * self.display_scale)))
-
-        if self.display_scale < 1.0:
-            raw_disp = cv2.resize(self.raw_rgb_full, (dw, dh), interpolation=cv2.INTER_AREA)
-            tissue_disp = cv2.resize(self.tissue_mask_full, (dw, dh), interpolation=cv2.INTER_NEAREST)
-            artifact_disp = cv2.resize(self.artifact_mask_full, (dw, dh), interpolation=cv2.INTER_NEAREST)
-        else:
+        if self.full_resolution_render_enabled:
+            self.display_scale = 1.0
             raw_disp = self.raw_rgb_full.copy()
             tissue_disp = self.tissue_mask_full.copy()
             artifact_disp = self.artifact_mask_full.copy()
+        else:
+            max_dim = 1400
+            self.display_scale = min(1.0, max_dim / max(h, w))
+            dw = max(1, int(round(w * self.display_scale)))
+            dh = max(1, int(round(h * self.display_scale)))
+
+            if self.display_scale < 1.0:
+                raw_disp = cv2.resize(self.raw_rgb_full, (dw, dh), interpolation=cv2.INTER_AREA)
+                tissue_disp = cv2.resize(self.tissue_mask_full, (dw, dh), interpolation=cv2.INTER_NEAREST)
+                artifact_disp = cv2.resize(self.artifact_mask_full, (dw, dh), interpolation=cv2.INTER_NEAREST)
+            else:
+                raw_disp = self.raw_rgb_full.copy()
+                tissue_disp = self.tissue_mask_full.copy()
+                artifact_disp = self.artifact_mask_full.copy()
 
         if self.mirror_enabled:
             raw_disp = raw_disp[:, ::-1, :].copy()
@@ -506,6 +734,7 @@ class MaskEditorLabel(QWidget):
 
     def refresh(self) -> None:
         self._update_draw_rect()
+        self._emit_view_changed_if_needed()
         self.update()
 
     def _widget_to_display_xy(self, pos: QPoint) -> Optional[tuple[int, int]]:
@@ -579,6 +808,104 @@ class MaskEditorLabel(QWidget):
         rect = self._display_rect_from_points([p1, p2], radius=10)
         return self._display_rect_to_widget_rect(rect)
 
+    def _polygon_preview_widget_rect(
+        self,
+        points: Optional[list[tuple[int, int]]] = None,
+        preview_end: Optional[tuple[int, int]] = None,
+    ) -> QRect:
+        pts = list(points) if points is not None else list(self._polygon_points_display)
+        end = preview_end if preview_end is not None else self._polygon_preview_end_display
+        if end is not None:
+            pts = pts + [end]
+        if not pts:
+            return QRect()
+        if len(pts) == 1:
+            rect = QRect(pts[0][0] - 8, pts[0][1] - 8, 16, 16)
+        else:
+            rect = self._display_rect_from_points(pts, radius=10)
+        return self._display_rect_to_widget_rect(rect)
+
+    def current_viewport_info(self) -> dict[str, object] | None:
+        if self.raw_rgb_full is None or self.raw_rgb_display is None or self._image_draw_rect.isNull():
+            return None
+        visible_widget = QRectF(self.rect()).intersected(self._image_draw_rect)
+        if visible_widget.isNull() or visible_widget.width() <= 1e-6 or visible_widget.height() <= 1e-6:
+            return None
+        draw = self._image_draw_rect
+        dx1 = (visible_widget.x() - draw.x()) / max(self.view_scale, 1e-6)
+        dy1 = (visible_widget.y() - draw.y()) / max(self.view_scale, 1e-6)
+        dx2 = (visible_widget.x() + visible_widget.width() - draw.x()) / max(self.view_scale, 1e-6)
+        dy2 = (visible_widget.y() + visible_widget.height() - draw.y()) / max(self.view_scale, 1e-6)
+        full_h, full_w = self.raw_rgb_full.shape[:2]
+        if self.mirror_enabled:
+            fx1 = float(full_w) - (dx2 / max(self.display_scale, 1e-6))
+            fx2 = float(full_w) - (dx1 / max(self.display_scale, 1e-6))
+        else:
+            fx1 = dx1 / max(self.display_scale, 1e-6)
+            fx2 = dx2 / max(self.display_scale, 1e-6)
+        fy1 = dy1 / max(self.display_scale, 1e-6)
+        fy2 = dy2 / max(self.display_scale, 1e-6)
+        x1 = max(0, min(full_w - 1, int(np.floor(min(fx1, fx2)))))
+        y1 = max(0, min(full_h - 1, int(np.floor(min(fy1, fy2)))))
+        x2 = max(x1 + 1, min(full_w, int(np.ceil(max(fx1, fx2)))))
+        y2 = max(y1 + 1, min(full_h, int(np.ceil(max(fy1, fy2)))))
+        return {
+            "visible_full_rect_xywh": (x1, y1, int(x2 - x1), int(y2 - y1)),
+            "visible_widget_rect_xywh": (
+                int(np.floor(visible_widget.x())),
+                int(np.floor(visible_widget.y())),
+                max(1, int(np.ceil(visible_widget.width()))),
+                max(1, int(np.ceil(visible_widget.height()))),
+            ),
+            "full_shape_hw": (int(full_h), int(full_w)),
+            "display_shape_hw": (int(self.raw_rgb_display.shape[0]), int(self.raw_rgb_display.shape[1])),
+            "display_scale": float(self.display_scale),
+            "view_scale": float(self.view_scale),
+            "zoom_factor": float(self.zoom_factor),
+            "mirror_enabled": bool(self.mirror_enabled),
+        }
+
+    def _full_rect_to_widget_rectf(self, full_rect_xywh: tuple[int, int, int, int]) -> QRectF:
+        if self.raw_rgb_full is None or self._image_draw_rect.isNull():
+            return QRectF()
+        x, y, w, h = [float(v) for v in full_rect_xywh]
+        full_w = float(self.raw_rgb_full.shape[1])
+        disp_scale = max(float(self.display_scale), 1e-6)
+        if self.mirror_enabled:
+            disp_x = (full_w - (x + w)) * disp_scale
+        else:
+            disp_x = x * disp_scale
+        disp_y = y * disp_scale
+        disp_w = w * disp_scale
+        disp_h = h * disp_scale
+        return QRectF(
+            self._image_draw_rect.x() + disp_x * self.view_scale,
+            self._image_draw_rect.y() + disp_y * self.view_scale,
+            disp_w * self.view_scale,
+            disp_h * self.view_scale,
+        )
+
+    def _emit_view_changed_if_needed(self) -> None:
+        info = self.current_viewport_info()
+        signature: tuple[object, ...] | None
+        if info is None:
+            signature = None
+        else:
+            signature = (
+                tuple(info["visible_full_rect_xywh"]),
+                tuple(info["visible_widget_rect_xywh"]),
+                tuple(info["full_shape_hw"]),
+                round(float(info["view_scale"]), 6),
+                round(float(info["display_scale"]), 6),
+                round(float(info["zoom_factor"]), 6),
+                bool(info["mirror_enabled"]),
+            )
+        if signature == self._last_view_signature:
+            return
+        self._last_view_signature = signature
+        if info is not None and self.on_view_changed is not None:
+            self.on_view_changed(info)
+
     def _update_widget_rect(self, rect: QRect) -> None:
         if rect.isNull():
             self.update()
@@ -599,6 +926,16 @@ class MaskEditorLabel(QWidget):
         self._line_erase_start_display = start
         self._line_erase_preview_end_display = end
         self._update_widget_rect(old_rect.united(self._line_preview_widget_rect()))
+
+    def _set_polygon_preview(
+        self,
+        points: Optional[list[tuple[int, int]]] = None,
+        preview_end: Optional[tuple[int, int]] = None,
+    ) -> None:
+        old_rect = self._polygon_preview_widget_rect()
+        self._polygon_points_display = list(points) if points is not None else []
+        self._polygon_preview_end_display = preview_end
+        self._update_widget_rect(old_rect.united(self._polygon_preview_widget_rect()))
 
     def _stroke_on_mask(self, mask: np.ndarray, start: tuple[int, int], end: tuple[int, int], radius: int, add: bool) -> None:
         value = 255 if add else 0
@@ -724,6 +1061,7 @@ class MaskEditorLabel(QWidget):
         painter.setClipRect(event.rect())
         painter.fillRect(self.rect(), QColor(26, 26, 26))
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
 
         if self.base_pixmap is None or self._image_draw_rect.isNull():
             painter.setPen(QColor(210, 210, 210))
@@ -732,8 +1070,27 @@ class MaskEditorLabel(QWidget):
 
         target = self._image_draw_rect
         source_rect = QRectF(self.base_pixmap.rect())
-        if self.raw_visible:
+        draw_base = bool(
+            self.raw_visible
+            and not (
+                self.full_resolution_render_enabled
+                and self.detail_patch_pixmap is not None
+                and self.detail_patch_full_rect_xywh is not None
+            )
+        )
+        if draw_base:
             painter.drawPixmap(target, self.base_pixmap, source_rect)
+        if self.raw_visible and self.detail_patch_pixmap is not None and self.detail_patch_full_rect_xywh is not None:
+            patch_target = self._full_rect_to_widget_rectf(self.detail_patch_full_rect_xywh)
+            if not patch_target.isNull() and patch_target.width() > 1e-6 and patch_target.height() > 1e-6:
+                smooth_before = painter.testRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+                patch_pix = self.detail_patch_pixmap
+                smooth_patch = bool(
+                    patch_pix.width() >= int(round(patch_target.width())) and patch_pix.height() >= int(round(patch_target.height()))
+                )
+                painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, smooth_patch)
+                painter.drawPixmap(patch_target, self.detail_patch_pixmap, QRectF(self.detail_patch_pixmap.rect()))
+                painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, smooth_before)
         if self.overlay_visible and self.overlay_pixmap is not None:
             painter.drawPixmap(target, self.overlay_pixmap, QRectF(self.overlay_pixmap.rect()))
         if self.aux_overlay_pixmap is not None:
@@ -794,6 +1151,37 @@ class MaskEditorLabel(QWidget):
             painter.drawEllipse(p1, max(3.0, 2.5 * self.view_scale), max(3.0, 2.5 * self.view_scale))
             painter.drawEllipse(p2, max(3.0, 2.5 * self.view_scale), max(3.0, 2.5 * self.view_scale))
 
+        if self._polygon_active and self._polygon_points_display:
+            poly_pen = QPen(QColor(255, 210, 80, 230), max(2.0, 2.0 * self.view_scale))
+            poly_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(poly_pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            draw_points = list(self._polygon_points_display)
+            if self._polygon_preview_end_display is not None:
+                draw_points.append(self._polygon_preview_end_display)
+            widget_pts = [
+                QPointF(target.x() + (px + 0.5) * self.view_scale, target.y() + (py + 0.5) * self.view_scale)
+                for px, py in draw_points
+            ]
+            for idx in range(1, len(widget_pts)):
+                painter.drawLine(widget_pts[idx - 1], widget_pts[idx])
+            if len(self._polygon_points_display) >= 3:
+                start = self._polygon_points_display[0]
+                end = self._polygon_points_display[-1]
+                p1 = QPointF(target.x() + (start[0] + 0.5) * self.view_scale, target.y() + (start[1] + 0.5) * self.view_scale)
+                p2 = QPointF(target.x() + (end[0] + 0.5) * self.view_scale, target.y() + (end[1] + 0.5) * self.view_scale)
+                close_pen = QPen(QColor(255, 210, 80, 120), max(1.0, 1.5 * self.view_scale), Qt.PenStyle.DashLine)
+                painter.setPen(close_pen)
+                painter.drawLine(p1, p2)
+                painter.setPen(poly_pen)
+            painter.setPen(Qt.PenStyle.NoPen)
+            for idx, pt in enumerate(widget_pts):
+                if idx == 0:
+                    painter.setBrush(QColor(255, 120, 80, 235))
+                else:
+                    painter.setBrush(QColor(255, 210, 80, 235))
+                painter.drawEllipse(pt, max(4.0, 3.0 * self.view_scale), max(4.0, 3.0 * self.view_scale))
+
         if self.brush_enabled and self.hover_pos_display is not None:
             hx, hy = self.hover_pos_display
             display_radius = max(1, int(round(self.brush_radius * self.display_scale)))
@@ -807,12 +1195,15 @@ class MaskEditorLabel(QWidget):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._update_draw_rect()
+        self._emit_view_changed_if_needed()
         self.update()
 
     def leaveEvent(self, event) -> None:
         self._set_hover_coord(None)
         if self._line_erase_active and self._line_erase_start_display is not None:
             self._set_line_erase_preview(self._line_erase_start_display, self._line_erase_start_display)
+        if self._polygon_active and self._polygon_points_display:
+            self._set_polygon_preview(list(self._polygon_points_display), None)
         super().leaveEvent(event)
 
     def enterEvent(self, event) -> None:
@@ -826,6 +1217,21 @@ class MaskEditorLabel(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         self.setFocus(Qt.FocusReason.MouseFocusReason)
+        if self._polygon_active and event.button() == Qt.MouseButton.LeftButton:
+            coord = self._widget_to_display_xy(event.position().toPoint())
+            if coord is not None:
+                points = list(self._polygon_points_display)
+                points.append(coord)
+                self._set_polygon_preview(points, coord)
+            event.accept()
+            return
+        if self._polygon_active and event.button() == Qt.MouseButton.RightButton:
+            if len(self._polygon_points_display) >= 3:
+                self.apply_polygon_fill()
+            else:
+                self.clear_polygon()
+            event.accept()
+            return
         if self._line_erase_active and event.button() == Qt.MouseButton.LeftButton:
             coord = self._widget_to_display_xy(event.position().toPoint())
             if coord is not None:
@@ -840,6 +1246,13 @@ class MaskEditorLabel(QWidget):
             self._set_line_erase_preview(None, None)
             event.accept()
             return
+        if not self.editing_enabled and event.button() == Qt.MouseButton.LeftButton:
+            self._panning = True
+            self._pan_start_widget = event.position().toPoint()
+            self._pan_start_offset = QPointF(self.pan_offset)
+            self._update_cursor()
+            event.accept()
+            return
         if not self.brush_enabled and event.button() == Qt.MouseButton.LeftButton:
             self._panning = True
             self._pan_start_widget = event.position().toPoint()
@@ -848,13 +1261,13 @@ class MaskEditorLabel(QWidget):
             event.accept()
             return
         if event.button() == Qt.MouseButton.LeftButton:
-            self._begin_stroke(add=True)
-            self._paint_at(event.position().toPoint(), add=True)
+            self._begin_stroke(add=self.primary_stroke_add_mode)
+            self._paint_at(event.position().toPoint(), add=self.primary_stroke_add_mode)
             event.accept()
             return
         if event.button() == Qt.MouseButton.RightButton:
-            self._begin_stroke(add=False)
-            self._paint_at(event.position().toPoint(), add=False)
+            self._begin_stroke(add=not self.primary_stroke_add_mode)
+            self._paint_at(event.position().toPoint(), add=not self.primary_stroke_add_mode)
             event.accept()
             return
         super().mousePressEvent(event)
@@ -869,10 +1282,12 @@ class MaskEditorLabel(QWidget):
                 self._pan_start_offset.y() + float(delta.y()),
             )
             self.refresh()
+        elif self._polygon_active:
+            self._set_hover_coord(coord)
+            self._set_polygon_preview(list(self._polygon_points_display), coord)
         elif self._painting:
             self.hover_pos_display = coord
-            add = bool(event.buttons() & Qt.MouseButton.LeftButton)
-            self._paint_at(event.position().toPoint(), add=add)
+            self._paint_at(event.position().toPoint(), add=self._stroke_add_mode)
         else:
             self._set_hover_coord(coord)
             if self._line_erase_active and self._line_erase_start_display is not None:
@@ -908,7 +1323,7 @@ class MaskEditorLabel(QWidget):
             old_rect = QRectF(self._image_draw_rect)
             old_zoom = float(self.zoom_factor)
             zoom_step = 1.12 if delta > 0 else 1 / 1.12
-            new_zoom = float(np.clip(self.zoom_factor * zoom_step, 0.25, 8.0))
+            new_zoom = float(np.clip(self.zoom_factor * zoom_step, MASK_EDITOR_MIN_ZOOM_FACTOR, MASK_EDITOR_MAX_ZOOM_FACTOR))
             if abs(new_zoom - old_zoom) < 1e-9:
                 event.accept()
                 return
@@ -931,6 +1346,10 @@ class MaskEditorLabel(QWidget):
         event.accept()
 
     def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_E and self.editing_enabled:
+            self.activate_brush_tool(add=False)
+            event.accept()
+            return
         if event.key() == Qt.Key.Key_A:
             self.set_active_layer("artifact")
             if self.on_active_layer_changed is not None:
@@ -959,6 +1378,10 @@ class MaskEditorLabel(QWidget):
             self.toggle_hand_override()
             event.accept()
             return
+        if event.key() == Qt.Key.Key_G and self.editing_enabled:
+            self.activate_polygon_tool()
+            event.accept()
+            return
         if event.key() == Qt.Key.Key_L:
             self.toggle_line_erase_mode()
             event.accept()
@@ -978,6 +1401,13 @@ class MaskEditorLabel(QWidget):
                 event.accept()
                 return
         if event.key() == Qt.Key.Key_C:
+            if self._polygon_active:
+                if self.apply_polygon_fill():
+                    event.accept()
+                    return
+                self.clear_polygon()
+                event.accept()
+                return
             if self.on_close_fill_requested is not None:
                 self.on_close_fill_requested()
                 event.accept()
@@ -991,6 +1421,10 @@ class MaskEditorLabel(QWidget):
             if self.undo_last_action():
                 event.accept()
                 return
+        if event.key() == Qt.Key.Key_Escape and self._polygon_active:
+            self.clear_polygon()
+            event.accept()
+            return
         super().keyPressEvent(event)
 
     def apply_line_erase(self) -> bool:
@@ -1017,6 +1451,35 @@ class MaskEditorLabel(QWidget):
         if self.on_mask_changed is not None:
             self.on_mask_changed()
         self._set_hover_coord(start)
+        return True
+
+    def apply_polygon_fill(self) -> bool:
+        if len(self._polygon_points_display) < 3:
+            return False
+        if self.tissue_mask_full is None or self.artifact_mask_full is None:
+            return False
+        points_full = np.asarray([self._display_to_full_xy(pt) for pt in self._polygon_points_display], dtype=np.int32)
+        if points_full.shape != (len(self._polygon_points_display), 2):
+            return False
+        self._remember_undo_state()
+        poly = points_full.reshape((-1, 1, 2))
+        target_full = self.tissue_mask_full if self.active_layer == "tissue" else self.artifact_mask_full
+        cv2.fillPoly(target_full, [poly], 255, lineType=cv2.LINE_8)
+        if self.active_layer == "tissue":
+            self.artifact_mask_full[self.tissue_mask_full > 0] = 0
+        else:
+            self.artifact_mask_full[self.tissue_mask_full > 0] = 0
+        keep_hover = self._polygon_points_display[0]
+        self._rebuild_display_buffers()
+        self.clear_polygon()
+        self._polygon_active = False
+        self._set_brush_enabled(False)
+        self._emit_tool_mode_changed()
+        self._update_cursor()
+        self.refresh()
+        if self.on_mask_changed is not None:
+            self.on_mask_changed()
+        self._set_hover_coord(keep_hover)
         return True
 
     def delete_component_under_cursor(self) -> bool:

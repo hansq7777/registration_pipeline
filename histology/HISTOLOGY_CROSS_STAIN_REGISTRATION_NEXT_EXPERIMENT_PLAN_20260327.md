@@ -333,7 +333,8 @@ Important:
 ### Priority 2: Second-line methods
 
 1. MIND-rigid or MIND-similarity.
-2. Weak affine only after one of the above clearly wins.
+2. Hybrid `shape-first -> fake-myelin local texture refinement`.
+3. Weak affine only after one of the above clearly wins.
 
 ### Priority 3: Selective high-risk methods
 
@@ -350,8 +351,9 @@ If we want the most informative next iteration with controlled effort, the recom
 1. Implement the gated benchmark harness.
 2. Run mask-driven rigid / similarity on all 131 usable units.
 3. Run NGF-rigid on the same set under the same gate.
-4. Start a small landmark annotation set in parallel.
-5. Only then decide whether MIND or weak affine is the better next branch.
+4. Run the hybrid `shape-first -> fake-myelin local texture refinement` experiment if shape-first shows a stable win.
+5. Start a small landmark annotation set in parallel.
+6. Only then decide whether MIND or weak affine is the better next branch.
 
 ## Decision Criteria After The First New Round
 
