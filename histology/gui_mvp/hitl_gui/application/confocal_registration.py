@@ -7450,6 +7450,36 @@ def _warp_tile_to_bbox(
     }
 
 
+def _clip_warp_entry_to_crop(
+    entry: dict[str, Any],
+    crop_bbox_xyxy: list[int] | tuple[int, int, int, int],
+) -> dict[str, Any] | None:
+    crop_x0, crop_y0, crop_x1, crop_y1 = [int(v) for v in crop_bbox_xyxy]
+    ex0, ey0, ex1, ey1 = [int(v) for v in list(entry.get("bbox_xyxy") or [0, 0, 0, 0])[:4]]
+    ix0 = max(crop_x0, ex0)
+    iy0 = max(crop_y0, ey0)
+    ix1 = min(crop_x1, ex1)
+    iy1 = min(crop_y1, ey1)
+    if ix1 <= ix0 or iy1 <= iy0:
+        return None
+    src_x0 = int(ix0 - ex0)
+    src_y0 = int(iy0 - ey0)
+    src_x1 = src_x0 + int(ix1 - ix0)
+    src_y1 = src_y0 + int(iy1 - iy0)
+    image_u8 = np.asarray(entry["image_u8"], dtype=np.uint8)[src_y0:src_y1, src_x0:src_x1]
+    mask_u8 = np.asarray(entry["mask_u8"], dtype=np.uint8)[src_y0:src_y1, src_x0:src_x1]
+    weight_f32 = None
+    if entry.get("weight_f32") is not None:
+        weight_f32 = np.asarray(entry["weight_f32"], dtype=np.float32)[src_y0:src_y1, src_x0:src_x1]
+    return {
+        "scene_bbox_xyxy": [int(ix0), int(iy0), int(ix1), int(iy1)],
+        "crop_bbox_xyxy": [int(ix0 - crop_x0), int(iy0 - crop_y0), int(ix1 - crop_x0), int(iy1 - crop_y0)],
+        "image_u8": image_u8,
+        "mask_u8": mask_u8,
+        "weight_f32": weight_f32,
+    }
+
+
 def _prediction_expected_name_for_source(source_path: Path) -> str:
     name = _portable_basename(source_path)
     if name.lower().endswith(".ome.tif"):
@@ -7946,26 +7976,25 @@ def _build_step7_session_export_products(
             local_weight_f32=weight_map,
         )
         warped_entries_by_tile[int(tile_index)] = entry
-        bx0, by0, bx1, by1 = [int(v) for v in entry["bbox_xyxy"]]
-        rx0 = bx0 - crop_x0
-        ry0 = by0 - crop_y0
-        rx1 = rx0 + int(entry["image_u8"].shape[1])
-        ry1 = ry0 + int(entry["image_u8"].shape[0])
+        clipped_entry = _clip_warp_entry_to_crop(entry, crop_bbox)
+        if clipped_entry is None:
+            continue
+        rx0, ry0, rx1, ry1 = [int(v) for v in clipped_entry["crop_bbox_xyxy"]]
         state = str(record.get("tile_state") or "")
         state_base = 20000 if state == TileState.FROZEN.value else 10000
         priority_value = int(state_base + round(max(0.0, min(1.0, float(record.get("final_cc", 0.0) or 0.0))) * 1000.0))
-        mask_bool = entry["mask_u8"] > 0
+        mask_bool = np.asarray(clipped_entry["mask_u8"], dtype=np.uint8) > 0
         current_priority = hard_priority[ry0:ry1, rx0:rx1]
         replace = mask_bool & (np.uint16(priority_value) >= current_priority)
         hard_priority[ry0:ry1, rx0:rx1][replace] = np.uint16(priority_value)
-        hard_img[ry0:ry1, rx0:rx1][replace] = entry["image_u8"][replace]
+        hard_img[ry0:ry1, rx0:rx1][replace] = np.asarray(clipped_entry["image_u8"], dtype=np.uint8)[replace]
         hard_support[ry0:ry1, rx0:rx1][mask_bool] = 255
         tile_id_map[ry0:ry1, rx0:rx1][replace] = np.uint16(tile_index + 1)
 
-        if entry["weight_f32"] is not None:
-            wq = np.clip(np.round(entry["weight_f32"] * 255.0), 0, 65535).astype(np.uint16)
+        if clipped_entry["weight_f32"] is not None:
+            wq = np.clip(np.round(np.asarray(clipped_entry["weight_f32"], dtype=np.float32) * 255.0), 0, 65535).astype(np.uint16)
             wq[~mask_bool] = 0
-            blend_accum[ry0:ry1, rx0:rx1] += entry["image_u8"].astype(np.uint32) * wq.astype(np.uint32)
+            blend_accum[ry0:ry1, rx0:rx1] += np.asarray(clipped_entry["image_u8"], dtype=np.uint8).astype(np.uint32) * wq.astype(np.uint32)
             blend_weight[ry0:ry1, rx0:rx1] += wq
 
         basename = _portable_basename(confocal_sources[tile_index]) if tile_index < len(confocal_sources) else ""
@@ -7979,12 +8008,19 @@ def _build_step7_session_export_products(
                 local_mask_u8=np.full(pred_u8.shape[:2], 255, dtype=np.uint8),
                 local_weight_f32=weight_map if weight_map is not None else np.ones(pred_u8.shape[:2], dtype=np.float32),
             )
-            pred_mask_bool = pred_entry["mask_u8"] > 0
-            pred_wq = np.clip(np.round(np.asarray(pred_entry["weight_f32"], dtype=np.float32) * 255.0), 0, 65535).astype(np.uint16)
+            clipped_pred_entry = _clip_warp_entry_to_crop(pred_entry, crop_bbox)
+            if clipped_pred_entry is None:
+                continue
+            pred_mask_bool = np.asarray(clipped_pred_entry["mask_u8"], dtype=np.uint8) > 0
+            pred_rx0, pred_ry0, pred_rx1, pred_ry1 = [int(v) for v in clipped_pred_entry["crop_bbox_xyxy"]]
+            pred_weight_f32 = clipped_pred_entry["weight_f32"]
+            if pred_weight_f32 is None:
+                pred_weight_f32 = np.ones(np.asarray(clipped_pred_entry["image_u8"]).shape[:2], dtype=np.float32)
+            pred_wq = np.clip(np.round(np.asarray(pred_weight_f32, dtype=np.float32) * 255.0), 0, 65535).astype(np.uint16)
             pred_wq[~pred_mask_bool] = 0
-            prediction_accum[ry0:ry1, rx0:rx1] += pred_entry["image_u8"].astype(np.uint32) * pred_wq.astype(np.uint32)
-            prediction_weight[ry0:ry1, rx0:rx1] += pred_wq
-            prediction_support[ry0:ry1, rx0:rx1][pred_mask_bool] = 255
+            prediction_accum[pred_ry0:pred_ry1, pred_rx0:pred_rx1] += np.asarray(clipped_pred_entry["image_u8"], dtype=np.uint8).astype(np.uint32) * pred_wq.astype(np.uint32)
+            prediction_weight[pred_ry0:pred_ry1, pred_rx0:pred_rx1] += pred_wq
+            prediction_support[pred_ry0:pred_ry1, pred_rx0:pred_rx1][pred_mask_bool] = 255
             prediction_resolved_count += 1
 
     seam_rows, seam_summary = _compute_step7_seam_qc(trusted_records, warped_entries_by_tile)

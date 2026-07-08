@@ -4,10 +4,12 @@ from typing import Callable, Optional
 
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QCursor, QImage, QPainter, QPen, QPixmap, QBrush
+from PySide6.QtGui import QColor, QCursor, QImage, QPainter, QPen, QPixmap, QBrush, QPainterPath, QPolygonF
 from PySide6.QtWidgets import (
     QGraphicsEllipseItem,
+    QGraphicsPathItem,
     QGraphicsPixmapItem,
+    QGraphicsPolygonItem,
     QGraphicsRectItem,
     QGraphicsScene,
     QGraphicsSimpleTextItem,
@@ -200,6 +202,535 @@ class ImageSceneView(QGraphicsView):
     @property
     def scene_obj(self) -> QGraphicsScene:
         return self._scene
+
+
+class RibbonAnnotationView(QGraphicsView):
+    curvesChanged = Signal(object)
+    probeChanged = Signal(object)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
+        self._scene = QGraphicsScene(self)
+        self.setScene(self._scene)
+        self._pixmap_item: Optional[QGraphicsPixmapItem] = None
+        self._tile_polygon_items: list[QGraphicsPolygonItem] = []
+        self._tile_label_items: list[QGraphicsSimpleTextItem] = []
+        self._curve_path_items: dict[str, QGraphicsPathItem] = {}
+        self._curve_point_items: dict[str, list[QGraphicsEllipseItem]] = {"surface": [], "interface": []}
+        self._preview_path_item: Optional[QGraphicsPathItem] = None
+        self._curves: dict[str, list[tuple[float, float]]] = {"surface": [], "interface": []}
+        self._active_curve: Optional[str] = None
+        self._curve_drawing_active: bool = False
+        self._last_curve_scene_pos: Optional[QPointF] = None
+        self._preview_scene_pos: Optional[QPointF] = None
+        self._tile_rows: list[dict[str, object]] = []
+        self._tile_include_map: dict[int, bool] = {}
+        self._current_tile_index: int | None = None
+        self._active_probe: bool = False
+        self._probe_stage: str = "idle"
+        self._probe_depth_start: Optional[QPointF] = None
+        self._probe_depth_end: Optional[QPointF] = None
+        self._probe_width_vector: Optional[QPointF] = None
+        self._probe_preview_pos: Optional[QPointF] = None
+        self._probe_polygon_item: Optional[QGraphicsPolygonItem] = None
+        self._probe_axis_item: Optional[QGraphicsPathItem] = None
+        self._probe_tick_items: list[QGraphicsPathItem] = []
+        self._saved_probe_items: list[QGraphicsPolygonItem | QGraphicsPathItem | QGraphicsSimpleTextItem] = []
+        self._saved_probe_payloads: list[dict[str, object]] = []
+
+    def clear_all(self) -> None:
+        self._scene.clear()
+        self._pixmap_item = None
+        self._tile_polygon_items = []
+        self._tile_label_items = []
+        self._curve_path_items = {}
+        self._curve_point_items = {"surface": [], "interface": []}
+        self._preview_path_item = None
+        self._preview_scene_pos = None
+        self._probe_polygon_item = None
+        self._probe_axis_item = None
+        self._probe_tick_items = []
+        self._saved_probe_items = []
+
+    def set_rgb_image(self, width: int, height: int, data: bytes) -> None:
+        self.clear_all()
+        image = qimage_from_rgb_bytes(width, height, data)
+        pixmap = QPixmap.fromImage(image)
+        self._pixmap_item = self._scene.addPixmap(pixmap)
+        self._scene.setSceneRect(QRectF(0, 0, width, height))
+        self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        self._rebuild_overlays()
+
+    def capture_view_state(self) -> dict[str, object]:
+        center = self.mapToScene(self.viewport().rect().center())
+        return {
+            "center_scene_xy": [float(center.x()), float(center.y())],
+            "transform": self.transform(),
+        }
+
+    def restore_view_state(self, state: dict[str, object] | None) -> None:
+        if not isinstance(state, dict):
+            return
+        transform = state.get("transform")
+        if transform is not None:
+            self.setTransform(transform)
+        center_xy = state.get("center_scene_xy")
+        if isinstance(center_xy, (list, tuple)) and len(center_xy) == 2:
+            self.centerOn(float(center_xy[0]), float(center_xy[1]))
+
+    @property
+    def scene_obj(self) -> QGraphicsScene:
+        return self._scene
+
+    def set_active_curve(self, name: Optional[str]) -> None:
+        if name not in {None, "surface", "interface"}:
+            return
+        if name is not None:
+            self._active_probe = False
+            self._probe_stage = "idle"
+        self._active_curve = name
+        self._curve_drawing_active = False
+        self._last_curve_scene_pos = None
+        self._preview_scene_pos = None
+        self.setDragMode(
+            QGraphicsView.DragMode.NoDrag if self._active_curve is not None else QGraphicsView.DragMode.ScrollHandDrag
+        )
+        self.viewport().setCursor(
+            Qt.CursorShape.CrossCursor if self._active_curve is not None else Qt.CursorShape.OpenHandCursor
+        )
+        self._rebuild_preview_path()
+
+    def set_probe_mode(self, active: bool) -> None:
+        self._active_probe = bool(active)
+        if self._active_probe:
+            self.set_active_curve(None)
+            self._probe_stage = "depth"
+            self.setDragMode(QGraphicsView.DragMode.NoDrag)
+            self.viewport().setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self._probe_stage = "idle"
+            self._probe_preview_pos = None
+            self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+            self.viewport().setCursor(Qt.CursorShape.OpenHandCursor)
+        self._rebuild_overlays()
+
+    def clear_probe(self) -> None:
+        self._probe_depth_start = None
+        self._probe_depth_end = None
+        self._probe_width_vector = None
+        self._probe_preview_pos = None
+        self._probe_stage = "depth" if self._active_probe else "idle"
+        self._rebuild_overlays()
+        self.probeChanged.emit(self.probe_snapshot())
+
+    def reverse_probe_depth(self) -> None:
+        if self._probe_depth_start is None or self._probe_depth_end is None:
+            return
+        self._probe_depth_start, self._probe_depth_end = self._probe_depth_end, self._probe_depth_start
+        if self._probe_width_vector is not None:
+            self._probe_width_vector = QPointF(-self._probe_width_vector.x(), -self._probe_width_vector.y())
+        self._rebuild_overlays()
+        self.probeChanged.emit(self.probe_snapshot())
+
+    def set_saved_probes(self, probes: list[dict[str, object]] | None) -> None:
+        self._saved_probe_payloads = [dict(row) for row in list(probes or [])]
+        self._rebuild_overlays()
+
+    def probe_snapshot(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "active": bool(self._active_probe),
+            "stage": str(self._probe_stage),
+            "complete": False,
+        }
+        if self._probe_depth_start is not None:
+            payload["depth_start_scene_xy"] = [float(self._probe_depth_start.x()), float(self._probe_depth_start.y())]
+        if self._probe_depth_end is not None:
+            payload["depth_end_scene_xy"] = [float(self._probe_depth_end.x()), float(self._probe_depth_end.y())]
+        if self._probe_width_vector is not None:
+            payload["width_vector_scene_xy"] = [float(self._probe_width_vector.x()), float(self._probe_width_vector.y())]
+            payload["width_px"] = float(2.0 * np.hypot(float(self._probe_width_vector.x()), float(self._probe_width_vector.y())))
+        payload["complete"] = bool(
+            self._probe_depth_start is not None
+            and self._probe_depth_end is not None
+            and self._probe_width_vector is not None
+        )
+        return payload
+
+    def active_curve(self) -> Optional[str]:
+        return self._active_curve
+
+    def curve_points(self, name: str) -> list[tuple[float, float]]:
+        return list(self._curves.get(name, []))
+
+    def set_curve_points(self, name: str, points_xy: list[tuple[float, float]] | np.ndarray | None) -> None:
+        if name not in self._curves:
+            return
+        pts: list[tuple[float, float]] = []
+        if points_xy is not None:
+            for pt in list(points_xy):
+                if len(pt) < 2:
+                    continue
+                pts.append((float(pt[0]), float(pt[1])))
+        self._curves[name] = pts
+        self._rebuild_overlays()
+        self.curvesChanged.emit(self.curve_snapshot())
+
+    def clear_curve(self, name: str) -> None:
+        self.set_curve_points(name, [])
+
+    def undo_last_point(self, name: Optional[str] = None) -> None:
+        target = name or self._active_curve
+        if target not in self._curves:
+            return
+        if not self._curves[target]:
+            return
+        self._curves[target] = self._curves[target][:-1]
+        self._rebuild_overlays()
+        self.curvesChanged.emit(self.curve_snapshot())
+
+    def curve_snapshot(self) -> dict[str, list[list[float]]]:
+        return {
+            "surface": [[float(x), float(y)] for x, y in self._curves.get("surface", [])],
+            "interface": [[float(x), float(y)] for x, y in self._curves.get("interface", [])],
+        }
+
+    def set_tile_overlay(
+        self,
+        tile_rows: list[dict[str, object]],
+        *,
+        include_map: dict[int, bool] | None = None,
+        current_tile_index: int | None = None,
+    ) -> None:
+        self._tile_rows = [dict(row) for row in list(tile_rows or [])]
+        self._tile_include_map = {int(k): bool(v) for k, v in dict(include_map or {}).items()}
+        self._current_tile_index = None if current_tile_index is None else int(current_tile_index)
+        self._rebuild_overlays()
+
+    def _scene_polygon_for_row(self, row: dict[str, object]) -> np.ndarray | None:
+        bbox = row.get("final_scene_bbox_xyxy") or row.get("pred_scene_bbox_xyxy") or row.get("nominal_scene_bbox_xyxy")
+        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+            x0, y0, x1, y1 = [float(v) for v in bbox]
+            return np.asarray([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float32)
+        candidates = (
+            row.get("final_scene_polygon_xy"),
+            row.get("pred_scene_polygon_xy"),
+            row.get("nominal_scene_polygon_xy"),
+        )
+        for value in candidates:
+            arr = np.asarray(value, dtype=np.float32)
+            if arr.ndim == 2 and arr.shape[0] >= 3 and arr.shape[1] == 2:
+                return arr
+        bbox = row.get("final_scene_bbox_xyxy") or row.get("pred_scene_bbox_xyxy") or row.get("nominal_scene_bbox_xyxy")
+        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+            x0, y0, x1, y1 = [float(v) for v in bbox]
+            return np.asarray([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float32)
+        return None
+
+    def _rebuild_overlays(self) -> None:
+        for item in self._tile_polygon_items:
+            self._scene.removeItem(item)
+        for item in self._tile_label_items:
+            self._scene.removeItem(item)
+        for item in self._curve_path_items.values():
+            self._scene.removeItem(item)
+        for items in self._curve_point_items.values():
+            for item in items:
+                self._scene.removeItem(item)
+        for item in self._probe_tick_items:
+            self._scene.removeItem(item)
+        if self._probe_polygon_item is not None:
+            self._scene.removeItem(self._probe_polygon_item)
+        if self._probe_axis_item is not None:
+            self._scene.removeItem(self._probe_axis_item)
+        for item in self._saved_probe_items:
+            self._scene.removeItem(item)
+        self._tile_polygon_items = []
+        self._tile_label_items = []
+        self._curve_path_items = {}
+        self._curve_point_items = {"surface": [], "interface": []}
+        self._probe_polygon_item = None
+        self._probe_axis_item = None
+        self._probe_tick_items = []
+        self._saved_probe_items = []
+
+        for row in self._tile_rows:
+            pts = self._scene_polygon_for_row(row)
+            if pts is None:
+                continue
+            idx = int(row.get("tile_index", -1))
+            include = bool(self._tile_include_map.get(idx, False))
+            color = QColor(56, 168, 106, 220) if include else QColor(198, 72, 72, 220)
+            if self._current_tile_index is not None and idx == int(self._current_tile_index):
+                color = QColor(255, 215, 64, 245)
+            poly = QPolygonF([QPointF(float(x), float(y)) for x, y in pts])
+            item = QGraphicsPolygonItem(poly)
+            item.setPen(QPen(color, 2))
+            fill = QColor(color)
+            fill.setAlpha(40 if include else 24)
+            item.setBrush(QBrush(fill))
+            self._scene.addItem(item)
+            self._tile_polygon_items.append(item)
+            cx = float(np.mean(pts[:, 0]))
+            cy = float(np.mean(pts[:, 1]))
+            label = QGraphicsSimpleTextItem(str(row.get("label") or f"T{idx:02d}"))
+            label.setBrush(QBrush(QColor(25, 25, 25)))
+            label.setPos(cx - 22.0, cy - 10.0)
+            self._scene.addItem(label)
+            self._tile_label_items.append(label)
+
+        curve_styles = {
+            "surface": QColor(28, 120, 255, 245),
+            "interface": QColor(255, 96, 32, 245),
+        }
+        for name, pts in self._curves.items():
+            if pts:
+                path = QPainterPath(QPointF(float(pts[0][0]), float(pts[0][1])))
+                for x, y in pts[1:]:
+                    path.lineTo(float(x), float(y))
+                path_item = QGraphicsPathItem(path)
+                pen = QPen(curve_styles[name], 3)
+                path_item.setPen(pen)
+                self._scene.addItem(path_item)
+                self._curve_path_items[name] = path_item
+                point_items: list[QGraphicsEllipseItem] = []
+                for i, (x, y) in enumerate(pts):
+                    ell = QGraphicsEllipseItem(float(x - 4.0), float(y - 4.0), 8.0, 8.0)
+                    ell.setPen(QPen(QColor(255, 255, 255, 235), 1))
+                    ell.setBrush(QBrush(curve_styles[name]))
+                    self._scene.addItem(ell)
+                    point_items.append(ell)
+                    if i == 0:
+                        txt = QGraphicsSimpleTextItem("start")
+                        txt.setBrush(QBrush(curve_styles[name]))
+                        txt.setPos(float(x + 5.0), float(y + 5.0))
+                        self._scene.addItem(txt)
+                        self._tile_label_items.append(txt)
+                self._curve_point_items[name] = point_items
+        self._rebuild_saved_probe_items()
+        self._rebuild_probe_overlay()
+        self._rebuild_preview_path()
+
+    def _probe_geometry_points(self, preview_pos: QPointF | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+        if self._probe_depth_start is None or self._probe_depth_end is None:
+            return None
+        start = np.asarray([float(self._probe_depth_start.x()), float(self._probe_depth_start.y())], dtype=np.float32)
+        end = np.asarray([float(self._probe_depth_end.x()), float(self._probe_depth_end.y())], dtype=np.float32)
+        axis = end - start
+        length = float(np.linalg.norm(axis))
+        if length <= 1e-3:
+            return None
+        unit = axis / length
+        normal = np.asarray([-unit[1], unit[0]], dtype=np.float32)
+        width_vec = None
+        if self._probe_width_vector is not None:
+            width_vec = np.asarray([float(self._probe_width_vector.x()), float(self._probe_width_vector.y())], dtype=np.float32)
+        elif preview_pos is not None:
+            p = np.asarray([float(preview_pos.x()), float(preview_pos.y())], dtype=np.float32)
+            mid = 0.5 * (start + end)
+            width_vec = normal * float(np.dot(p - mid, normal))
+        if width_vec is None:
+            return None
+        if float(np.linalg.norm(width_vec)) <= 1.0:
+            return None
+        corners = np.asarray([start - width_vec, start + width_vec, end + width_vec, end - width_vec], dtype=np.float32)
+        return corners, start, end
+
+    def _rebuild_saved_probe_items(self) -> None:
+        color = QColor(180, 90, 220, 150)
+        for row in self._saved_probe_payloads:
+            corners = np.asarray(row.get("oriented_rectangle_corners_scene_xy"), dtype=np.float32)
+            if corners.ndim != 2 or corners.shape[0] < 4 or corners.shape[1] != 2:
+                continue
+            poly = QPolygonF([QPointF(float(x), float(y)) for x, y in corners[:4]])
+            item = QGraphicsPolygonItem(poly)
+            item.setPen(QPen(color, 2, Qt.PenStyle.DotLine))
+            item.setBrush(QBrush(QColor(180, 90, 220, 18)))
+            self._scene.addItem(item)
+            self._saved_probe_items.append(item)
+            label = QGraphicsSimpleTextItem(str(row.get("probe_id") or "probe"))
+            label.setBrush(QBrush(color))
+            label.setPos(float(corners[0, 0]) + 4.0, float(corners[0, 1]) - 16.0)
+            self._scene.addItem(label)
+            self._saved_probe_items.append(label)
+
+    def _rebuild_probe_overlay(self) -> None:
+        geom = self._probe_geometry_points(self._probe_preview_pos)
+        if geom is None:
+            return
+        corners, start, end = geom
+        color = QColor(255, 208, 48, 245)
+        poly = QPolygonF([QPointF(float(x), float(y)) for x, y in corners])
+        item = QGraphicsPolygonItem(poly)
+        item.setPen(QPen(color, 3))
+        item.setBrush(QBrush(QColor(255, 208, 48, 28)))
+        self._scene.addItem(item)
+        self._probe_polygon_item = item
+        path = QPainterPath(QPointF(float(start[0]), float(start[1])))
+        path.lineTo(QPointF(float(end[0]), float(end[1])))
+        axis_item = QGraphicsPathItem(path)
+        axis_item.setPen(QPen(QColor(28, 120, 255, 245), 3))
+        self._scene.addItem(axis_item)
+        self._probe_axis_item = axis_item
+        for frac in np.linspace(0.0, 1.0, 6, dtype=np.float32):
+            p0 = corners[0] * (1.0 - float(frac)) + corners[3] * float(frac)
+            p1 = corners[1] * (1.0 - float(frac)) + corners[2] * float(frac)
+            tick = QPainterPath(QPointF(float(p0[0]), float(p0[1])))
+            tick.lineTo(QPointF(float(p1[0]), float(p1[1])))
+            tick_item = QGraphicsPathItem(tick)
+            tick_item.setPen(QPen(QColor(255, 208, 48, 175), 1, Qt.PenStyle.DashLine))
+            self._scene.addItem(tick_item)
+            self._probe_tick_items.append(tick_item)
+
+    def _rebuild_preview_path(self) -> None:
+        if self._preview_path_item is not None:
+            self._scene.removeItem(self._preview_path_item)
+            self._preview_path_item = None
+        if self._active_curve is None or self._preview_scene_pos is None:
+            return
+        pts = self._curves.get(self._active_curve, [])
+        if not pts:
+            return
+        path = QPainterPath(QPointF(float(pts[0][0]), float(pts[0][1])))
+        for x, y in pts[1:]:
+            path.lineTo(float(x), float(y))
+        path.lineTo(self._preview_scene_pos)
+        item = QGraphicsPathItem(path)
+        color = QColor(28, 120, 255, 180) if self._active_curve == "surface" else QColor(255, 96, 32, 180)
+        item.setPen(QPen(color, 2, Qt.PenStyle.DashLine))
+        self._scene.addItem(item)
+        self._preview_path_item = item
+
+    def _clamp_scene_pos(self, scene_pos: QPointF) -> QPointF:
+        rect = self._scene.sceneRect()
+        return QPointF(
+            min(max(float(scene_pos.x()), float(rect.left())), float(rect.right())),
+            min(max(float(scene_pos.y()), float(rect.top())), float(rect.bottom())),
+        )
+
+    def _append_curve_point_if_far_enough(self, scene_pos: QPointF) -> bool:
+        if self._active_curve is None:
+            return False
+        last = self._last_curve_scene_pos
+        if last is not None:
+            dx = float(scene_pos.x() - last.x())
+            dy = float(scene_pos.y() - last.y())
+            if (dx * dx + dy * dy) < 9.0:
+                return False
+        pts = list(self._curves.get(self._active_curve, []))
+        pts.append((float(scene_pos.x()), float(scene_pos.y())))
+        self._curves[self._active_curve] = pts
+        self._last_curve_scene_pos = QPointF(scene_pos)
+        return True
+
+    def mousePressEvent(self, event) -> None:
+        if self._active_probe and event.button() == Qt.MouseButton.LeftButton:
+            scene_pos = self._clamp_scene_pos(self.mapToScene(event.pos()))
+            if self._probe_stage in {"depth", "idle"}:
+                self._probe_depth_start = QPointF(scene_pos)
+                self._probe_depth_end = QPointF(scene_pos)
+                self._probe_width_vector = None
+                self._probe_stage = "depth_drag"
+            elif self._probe_stage == "width":
+                self._probe_preview_pos = QPointF(scene_pos)
+                self._probe_stage = "width_drag"
+            event.accept()
+            return
+        if self._active_curve is not None and event.button() == Qt.MouseButton.LeftButton:
+            scene_pos = self._clamp_scene_pos(self.mapToScene(event.pos()))
+            self._curve_drawing_active = True
+            self._preview_scene_pos = None
+            changed = self._append_curve_point_if_far_enough(scene_pos)
+            if changed:
+                self._rebuild_overlays()
+                self.curvesChanged.emit(self.curve_snapshot())
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._active_probe:
+            scene_pos = self._clamp_scene_pos(self.mapToScene(event.pos()))
+            if self._probe_stage == "depth_drag":
+                self._probe_depth_end = QPointF(scene_pos)
+                self._rebuild_overlays()
+                self.probeChanged.emit(self.probe_snapshot())
+                event.accept()
+                return
+            if self._probe_stage == "width_drag":
+                self._probe_preview_pos = QPointF(scene_pos)
+                self._rebuild_overlays()
+                self.probeChanged.emit(self.probe_snapshot())
+                event.accept()
+                return
+        if self._active_curve is not None and self._curve_drawing_active:
+            scene_pos = self._clamp_scene_pos(self.mapToScene(event.pos()))
+            changed = self._append_curve_point_if_far_enough(scene_pos)
+            if changed:
+                self._rebuild_overlays()
+                self.curvesChanged.emit(self.curve_snapshot())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self._active_probe and event.button() == Qt.MouseButton.LeftButton:
+            scene_pos = self._clamp_scene_pos(self.mapToScene(event.pos()))
+            if self._probe_stage == "depth_drag":
+                self._probe_depth_end = QPointF(scene_pos)
+                self._probe_stage = "width"
+                self._probe_preview_pos = None
+                self._rebuild_overlays()
+                self.probeChanged.emit(self.probe_snapshot())
+                event.accept()
+                return
+            if self._probe_stage == "width_drag":
+                if self._probe_depth_start is not None and self._probe_depth_end is not None:
+                    start = np.asarray([float(self._probe_depth_start.x()), float(self._probe_depth_start.y())], dtype=np.float32)
+                    end = np.asarray([float(self._probe_depth_end.x()), float(self._probe_depth_end.y())], dtype=np.float32)
+                    axis = end - start
+                    length = float(np.linalg.norm(axis))
+                    if length > 1e-3:
+                        unit = axis / length
+                        normal = np.asarray([-unit[1], unit[0]], dtype=np.float32)
+                        mid = 0.5 * (start + end)
+                        p = np.asarray([float(scene_pos.x()), float(scene_pos.y())], dtype=np.float32)
+                        width_vec = normal * float(np.dot(p - mid, normal))
+                        self._probe_width_vector = QPointF(float(width_vec[0]), float(width_vec[1]))
+                self._probe_stage = "complete"
+                self._probe_preview_pos = None
+                self._rebuild_overlays()
+                self.probeChanged.emit(self.probe_snapshot())
+                event.accept()
+                return
+        if self._active_curve is not None and event.button() == Qt.MouseButton.LeftButton and self._curve_drawing_active:
+            scene_pos = self._clamp_scene_pos(self.mapToScene(event.pos()))
+            changed = self._append_curve_point_if_far_enough(scene_pos)
+            self._curve_drawing_active = False
+            self._preview_scene_pos = None
+            if changed:
+                self._rebuild_overlays()
+                self.curvesChanged.emit(self.curve_snapshot())
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def wheelEvent(self, event) -> None:
+        if event.angleDelta().y() == 0:
+            super().wheelEvent(event)
+            return
+        old_anchor = self.transformationAnchor()
+        try:
+            self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+            factor = 1.15 if event.angleDelta().y() > 0 else (1.0 / 1.15)
+            self.scale(factor, factor)
+            event.accept()
+        finally:
+            self.setTransformationAnchor(old_anchor)
 
 
 class ConfocalAlignmentView(QGraphicsView):

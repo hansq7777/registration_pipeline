@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 import ctypes
+import csv
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import os
@@ -11,7 +12,7 @@ from pathlib import Path
 import shlex
 import sys
 from time import perf_counter
-from typing import Callable
+from typing import Any, Callable
 import json
 
 import cv2
@@ -19,6 +20,7 @@ import numpy as np
 from PySide6.QtCore import QObject, QSignalBlocker, QThread, QRectF, Qt, Signal, QTimer
 from PySide6.QtGui import QColor, QPen, QPixmap
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QFileDialog,
     QCheckBox,
@@ -27,7 +29,9 @@ from PySide6.QtWidgets import (
     QGraphicsRectItem,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -105,6 +109,15 @@ from ..application.confocal_registration import (
     run_confocal_seed_tile_screening,
     run_confocal_rigid_registration,
 )
+from ..application.step8_ribbon import (
+    compute_groupwise_depth_aligned_comparison,
+    compute_step8_depth_profile_probe,
+    compute_step8_ribbon_analysis,
+    load_step8_saved_ribbon_analysis,
+    load_step8_saved_ribbon_annotation,
+    save_step8_depth_profile_probe_result,
+    save_step8_ribbon_result,
+)
 from ..db import connect_db, transaction
 from ..domain import LoadedSlide, ProposalBox
 from ..pipeline_adapters import (
@@ -124,7 +137,7 @@ from ..pipeline_adapters import (
 )
 from ..pipeline_adapters.slide_io import effective_crop_rect_overview, extract_level0_bbox_rgb, load_slide_header_only, open_slide_handle
 from ..repositories import RevisionRepository, SectionRepository
-from ..widgets.graphics import ConfocalAlignmentView, DraggableProposalItem, ImageSceneView, qimage_from_rgb_array
+from ..widgets.graphics import ConfocalAlignmentView, DraggableProposalItem, ImageSceneView, RibbonAnnotationView, qimage_from_rgb_array
 from ..widgets.mask_editor import MaskEditorLabel
 from ..widgets.proposal_card import ProposalCard
 
@@ -934,6 +947,31 @@ class WorkflowWindow(QWidget):
         self.step7_frozen_tile_indices: set[int] = set()
         self.step7_frontier_tile_indices: set[int] = set()
         self.step7_last_export_dir: Path | None = None
+        self.step8_handoff_root: Path | None = None
+        self.step8_export_candidates: list[dict[str, object]] = []
+        self.step8_current_handoff_path: Path | None = None
+        self.step8_current_export_dir: Path | None = None
+        self.step8_current_handoff: dict[str, object] | None = None
+        self.step8_scene_base_rgb: np.ndarray | None = None
+        self.step8_scene_detail_rgb: np.ndarray | None = None
+        self.step8_scene_base_path: Path | None = None
+        self.step8_tile_rows: list[dict[str, object]] = []
+        self.step8_tile_row_by_index: dict[int, dict[str, object]] = {}
+        self.step8_tile_include_map: dict[int, bool] = {}
+        self.step8_tile_item_by_index: dict[int, QListWidgetItem] = {}
+        self.step8_current_tile_index: int | None = None
+        self.step8_selection_dirty: bool = False
+        self._step8_tile_list_updating: bool = False
+        self.step8_prediction_root: Path | None = None
+        self.step8_annotation_dirty: bool = False
+        self.step8_surface_points_scene_xy: list[tuple[float, float]] = []
+        self.step8_interface_points_scene_xy: list[tuple[float, float]] = []
+        self.step8_current_curve_mode: str | None = None
+        self.step8_probe_payload: dict[str, object] | None = None
+        self.step8_probe_result_files: dict[str, str] = {}
+        self.step8_saved_probe_annotations: list[dict[str, object]] = []
+        self.step8_ribbon_analysis_payload: dict[str, object] | None = None
+        self.step8_ribbon_result_files: dict[str, str] = {}
         self.proposal_items: list[DraggableProposalItem] = []
         self.crop_outline_items: list[QGraphicsRectItem] = []
         self.proposal_cards: list[ProposalCard] = []
@@ -2080,28 +2118,190 @@ class WorkflowWindow(QWidget):
         top.addWidget(back)
         layout.addLayout(top)
 
+        actions = QHBoxLayout()
+        self.step8_refresh_exports_button = QPushButton("Refresh Available Exports")
+        self.step8_refresh_exports_button.clicked.connect(self.refresh_step8_exports)
+        self.step8_load_selected_export_button = QPushButton("Load Selected Export")
+        self.step8_load_selected_export_button.clicked.connect(self.load_selected_step8_export)
+        self.step8_load_latest_export_button = QPushButton("Load Latest Step 7 Export")
+        self.step8_load_latest_export_button.clicked.connect(self.load_latest_step8_export)
+        self.step8_load_handoff_button = QPushButton("Browse Handoff JSON")
+        self.step8_load_handoff_button.clicked.connect(self.load_step8_handoff_dialog)
+        self.step8_save_tile_qc_button = QPushButton("Save Tile QC")
+        self.step8_save_tile_qc_button.clicked.connect(self.save_step8_tile_qc_selection)
+        self.step8_reset_default_button = QPushButton("Reset To Frozen/Accepted")
+        self.step8_reset_default_button.clicked.connect(self.reset_step8_tile_qc_to_default)
+        for widget in (
+            self.step8_refresh_exports_button,
+            self.step8_load_selected_export_button,
+            self.step8_load_latest_export_button,
+            self.step8_load_handoff_button,
+            self.step8_save_tile_qc_button,
+            self.step8_reset_default_button,
+        ):
+            actions.addWidget(widget)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+
+        ribbon_actions = QHBoxLayout()
+        self.step8_pan_mode_button = QPushButton("Grab")
+        self.step8_pan_mode_button.clicked.connect(self.step8_activate_grab_mode)
+        self.step8_draw_surface_button = QPushButton("Draw Surface")
+        self.step8_draw_surface_button.clicked.connect(lambda: self.step8_activate_curve_mode("surface"))
+        self.step8_draw_interface_button = QPushButton("Draw WM/GM Interface")
+        self.step8_draw_interface_button.clicked.connect(lambda: self.step8_activate_curve_mode("interface"))
+        self.step8_finish_curve_button = QPushButton("Finish Curve")
+        self.step8_finish_curve_button.clicked.connect(self.step8_finish_curve_mode)
+        self.step8_undo_curve_button = QPushButton("Undo Last Point")
+        self.step8_undo_curve_button.clicked.connect(self.step8_undo_current_curve_point)
+        self.step8_clear_surface_button = QPushButton("Clear Surface")
+        self.step8_clear_surface_button.clicked.connect(lambda: self.step8_clear_curve("surface"))
+        self.step8_clear_interface_button = QPushButton("Clear Interface")
+        self.step8_clear_interface_button.clicked.connect(lambda: self.step8_clear_curve("interface"))
+        self.step8_save_ribbon_button = QPushButton("Save Ribbon QC")
+        self.step8_save_ribbon_button.clicked.connect(self.save_step8_ribbon_annotation_only)
+        self.step8_compute_ribbon_button = QPushButton("Compute Ribbon")
+        self.step8_compute_ribbon_button.clicked.connect(self.compute_step8_ribbon_current_export)
+        self.step8_groupwise_compare_button = QPushButton("Run Groupwise Depth Comparison")
+        self.step8_groupwise_compare_button.clicked.connect(self.run_step8_groupwise_depth_comparison)
+        for widget in (
+            self.step8_pan_mode_button,
+            self.step8_draw_surface_button,
+            self.step8_draw_interface_button,
+            self.step8_finish_curve_button,
+            self.step8_undo_curve_button,
+            self.step8_clear_surface_button,
+            self.step8_clear_interface_button,
+            self.step8_save_ribbon_button,
+            self.step8_compute_ribbon_button,
+            self.step8_groupwise_compare_button,
+        ):
+            ribbon_actions.addWidget(widget)
+        ribbon_actions.addStretch(1)
+        layout.addLayout(ribbon_actions)
+
+        probe_actions = QHBoxLayout()
+        probe_actions.addWidget(QLabel("Depth Profile Probe"))
+        self.step8_draw_probe_button = QPushButton("Draw Probe")
+        self.step8_draw_probe_button.clicked.connect(self.step8_activate_probe_mode)
+        self.step8_clear_probe_button = QPushButton("Clear Probe")
+        self.step8_clear_probe_button.clicked.connect(self.step8_clear_probe)
+        self.step8_reverse_probe_button = QPushButton("Reverse Depth")
+        self.step8_reverse_probe_button.clicked.connect(self.step8_reverse_probe_depth)
+        self.step8_probe_depth_samples_spin = QSpinBox()
+        self.step8_probe_depth_samples_spin.setRange(32, 4096)
+        self.step8_probe_depth_samples_spin.setValue(512)
+        self.step8_probe_depth_samples_spin.setToolTip("Number of depth samples in the straightened probe strip")
+        self.step8_probe_window_fraction_spin = QDoubleSpinBox()
+        self.step8_probe_window_fraction_spin.setRange(0.01, 0.50)
+        self.step8_probe_window_fraction_spin.setSingleStep(0.01)
+        self.step8_probe_window_fraction_spin.setValue(0.05)
+        self.step8_probe_window_fraction_spin.setToolTip("Sliding window as a fraction of probe depth")
+        self.step8_probe_note_edit = QLineEdit()
+        self.step8_probe_note_edit.setPlaceholderText("optional probe note")
+        self.step8_compute_probe_button = QPushButton("Compute / Save Probe")
+        self.step8_compute_probe_button.clicked.connect(self.compute_step8_depth_profile_probe_current_export)
+        self.step8_load_probe_button = QPushButton("Load Previous Probes")
+        self.step8_load_probe_button.clicked.connect(self.load_step8_saved_depth_profile_probes)
+        for widget in (
+            self.step8_draw_probe_button,
+            self.step8_clear_probe_button,
+            self.step8_reverse_probe_button,
+            QLabel("Depth samples"),
+            self.step8_probe_depth_samples_spin,
+            QLabel("Window fraction"),
+            self.step8_probe_window_fraction_spin,
+            self.step8_probe_note_edit,
+            self.step8_compute_probe_button,
+            self.step8_load_probe_button,
+        ):
+            probe_actions.addWidget(widget)
+        probe_actions.addStretch(1)
+        layout.addLayout(probe_actions)
+
+        body = QHBoxLayout()
+
+        left = QVBoxLayout()
+        left.addWidget(QLabel("Available Step 7 Exports (Latest Per ROI)"))
+        self.step8_export_list = QListWidget()
+        self.step8_export_list.itemDoubleClicked.connect(lambda _item: self.load_selected_step8_export())
+        self.step8_export_list.currentRowChanged.connect(self.on_step8_export_candidate_changed)
+        left.addWidget(self.step8_export_list, 1)
+
+        middle = QVBoxLayout()
+        middle.addWidget(QLabel("Annotation Overview"))
+        self.step8_overview_view = RibbonAnnotationView()
+        self.step8_overview_view.setMinimumHeight(420)
+        self.step8_overview_view.curvesChanged.connect(self.on_step8_annotation_curves_changed)
+        self.step8_overview_view.probeChanged.connect(self.on_step8_probe_changed)
+        middle.addWidget(self.step8_overview_view, 4)
+        middle.addWidget(QLabel("Depth Field + Standardized Ribbon"))
+        self.step8_selected_tile_view = ImageSceneView()
+        self.step8_selected_tile_view.setMinimumHeight(260)
+        middle.addWidget(self.step8_selected_tile_view, 2)
+        middle.addWidget(QLabel("Depth Profile / Groupwise Comparison"))
+        self.step8_profile_view = ImageSceneView()
+        self.step8_profile_view.setMinimumHeight(220)
+        middle.addWidget(self.step8_profile_view, 2)
+
+        right = QVBoxLayout()
+        self.step8_selection_summary = QLabel("No Step 7 handoff loaded")
+        self.step8_selection_summary.setWordWrap(True)
+        right.addWidget(self.step8_selection_summary)
+
+        tile_actions = QHBoxLayout()
+        self.step8_include_selected_button = QPushButton("Include Selected")
+        self.step8_include_selected_button.clicked.connect(lambda: self._set_step8_selected_tile_items_checked(True))
+        self.step8_exclude_selected_button = QPushButton("Exclude Selected")
+        self.step8_exclude_selected_button.clicked.connect(lambda: self._set_step8_selected_tile_items_checked(False))
+        self.step8_include_all_button = QPushButton("Include All")
+        self.step8_include_all_button.clicked.connect(lambda: self._set_step8_all_tile_items_checked(True))
+        self.step8_exclude_all_button = QPushButton("Exclude All")
+        self.step8_exclude_all_button.clicked.connect(lambda: self._set_step8_all_tile_items_checked(False))
+        tile_actions.addWidget(self.step8_include_selected_button)
+        tile_actions.addWidget(self.step8_exclude_selected_button)
+        tile_actions.addWidget(self.step8_include_all_button)
+        tile_actions.addWidget(self.step8_exclude_all_button)
+        right.addLayout(tile_actions)
+
+        right.addWidget(QLabel("Tile Inclusion QC"))
+        self.step8_tile_list = QListWidget()
+        self.step8_tile_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.step8_tile_list.currentItemChanged.connect(self.on_step8_current_tile_item_changed)
+        self.step8_tile_list.itemChanged.connect(self.on_step8_tile_item_changed)
+        right.addWidget(self.step8_tile_list, 3)
+
+        right.addWidget(QLabel("Selected Tile Info"))
+        self.step8_selected_tile_info = QTextEdit()
+        self.step8_selected_tile_info.setReadOnly(True)
+        self.step8_selected_tile_info.setMinimumHeight(140)
+        right.addWidget(self.step8_selected_tile_info)
+
         info = QTextEdit()
         info.setReadOnly(True)
-        info.setMinimumHeight(420)
+        info.setMinimumHeight(150)
         info.setPlainText(
             "\n".join(
                 [
-                    "Step 8 Scaffold",
+                    "Step 8 Ribbon QC",
                     "- primary upstream input: Step 7 session export",
                     "- required handoff file: step8_handoff.json",
-                    "- planned second input: nnUNet 3D myelin prediction / inference export",
-                    "- planned functions:",
-                    "  * load registered confocal tile positions and transforms",
-                    "  * connect them to predicted myelin maps in the same Step 7 preview scene space",
-                    "  * visualize prediction overlays on the confocal-myelin tile view",
-                    "  * compute tile-wise and pooled fiber-density summaries",
+                    "- draw surface and WM/GM interface on the myelin scene",
+                    "- compute harmonic/Laplace depth field and standardized ribbon",
+                    "- compare myelin burden across normalized cortical depth",
+                    "- tile QC still controls which confocal-covered tiles contribute",
                     "",
                     "Latest Step 7 export: none",
                 ]
             )
         )
         self.step8_info = info
-        layout.addWidget(info)
+        right.addWidget(info)
+
+        body.addLayout(left, 3)
+        body.addLayout(middle, 5)
+        body.addLayout(right, 4)
+        layout.addLayout(body)
         page.setLayout(layout)
         return page
 
@@ -2671,6 +2871,16 @@ class WorkflowWindow(QWidget):
 
     def goto_stage8(self) -> None:
         self.pages.setCurrentIndex(self.PAGE_STAGE8)
+        if self.step8_handoff_root is None:
+            self.step8_handoff_root = self._default_step8_handoff_root()
+        self.refresh_step8_exports()
+        if self.step7_last_export_dir is not None:
+            direct_handoff = self.step7_last_export_dir / "step8_handoff.json"
+            if direct_handoff.exists():
+                if self.step8_current_handoff_path != direct_handoff:
+                    self._load_step8_handoff_into_gui(direct_handoff)
+                else:
+                    self._sync_step8_export_list_selection()
         self._refresh_step8_info()
 
     @staticmethod
@@ -2679,6 +2889,12 @@ class WorkflowWindow(QWidget):
         if candidate.exists():
             return candidate
         text = str(raw).strip()
+        if text.startswith("/mnt/") and len(text) >= 7 and text[5].isalpha() and text[6] == "/":
+            drive = text[5].upper()
+            tail = text[7:].replace("/", "\\")
+            alt = Path(f"{drive}:\\{tail}")
+            if alt.exists():
+                return alt
         if len(text) >= 3 and text[1] == ":" and text[2] in {"\\", "/"}:
             drive = text[0].lower()
             tail = text[3:].replace("\\", "/")
@@ -5580,18 +5796,59 @@ class WorkflowWindow(QWidget):
         if not hasattr(self, "step8_info") or self.step8_info is None:
             return
         latest_export = str(self.step7_last_export_dir) if self.step7_last_export_dir is not None else "none"
+        available_count = len(self.step8_export_candidates)
+        current_handoff = str(self.step8_current_handoff_path) if self.step8_current_handoff_path is not None else "none"
+        current_export = str(self.step8_current_export_dir) if self.step8_current_export_dir is not None else "none"
+        selection_json = (
+            str(self._step8_selection_json_path(self.step8_current_export_dir))
+            if self.step8_current_export_dir is not None
+            else "none"
+        )
+        selection_csv = (
+            str(self._step8_selection_csv_path(self.step8_current_export_dir))
+            if self.step8_current_export_dir is not None
+            else "none"
+        )
+        annotation_json = (
+            str(self._step8_ribbon_annotation_json_path(self.step8_current_export_dir))
+            if self.step8_current_export_dir is not None
+            else "none"
+        )
+        analysis_json = (
+            str(self._step8_ribbon_analysis_json_path(self.step8_current_export_dir))
+            if self.step8_current_export_dir is not None
+            else "none"
+        )
+        probe_manifest = (
+            str(self.step8_current_export_dir / "step8_depth_profile_probe_manifest.json")
+            if self.step8_current_export_dir is not None
+            else "none"
+        )
+        included_count = sum(1 for v in self.step8_tile_include_map.values() if bool(v))
+        tile_count = len(self.step8_tile_rows)
+        probe_complete = bool((self.step8_probe_payload or {}).get("complete")) if isinstance(self.step8_probe_payload, dict) else False
         lines = [
-            "Step 8 Scaffold",
+            "Step 8 Ribbon QC",
             "- primary upstream input: Step 7 session export",
             "- required handoff file: step8_handoff.json",
-            "- planned second input: nnUNet 3D myelin prediction / inference export",
-            "- planned functions:",
-            "  * load registered confocal tile positions and transforms",
-            "  * connect them to predicted myelin maps in the same Step 7 preview scene space",
-            "  * visualize prediction overlays on the confocal-myelin tile view",
-            "  * compute tile-wise and pooled fiber-density summaries",
+            "- current function: tile QC + cortical ribbon annotation + depth-aligned analysis",
+            "- depth profile probes measure NanoZoomer scene trends only and do not decide boundaries",
+            "- default tile include rule: accepted + frozen",
+            "- save outputs: step8_tile_selection_qc.*, step8_ribbon_annotation.json, step8_ribbon_analysis.json",
             "",
+            f"Available latest exports: {available_count}",
             f"Latest Step 7 export: {latest_export}",
+            f"Loaded Step 8 handoff: {current_handoff}",
+            f"Loaded export dir: {current_export}",
+            f"Prediction root: {self.step8_prediction_root or 'none'}",
+            f"Included tiles: {included_count}/{tile_count}",
+            f"Selection dirty: {self.step8_selection_dirty}",
+            f"Annotation dirty: {self.step8_annotation_dirty}",
+            f"Surface points: {len(self.step8_surface_points_scene_xy)}",
+            f"WM/GM interface points: {len(self.step8_interface_points_scene_xy)}",
+            f"Active draw mode: {self.step8_current_curve_mode or 'grab'}",
+            f"Current probe complete: {probe_complete}",
+            f"Saved depth probes: {len(self.step8_saved_probe_annotations)}",
         ]
         if self.step7_last_export_dir is not None:
             lines.extend(
@@ -5601,7 +5858,943 @@ class WorkflowWindow(QWidget):
                     f"- tile_transforms_csv: {self.step7_last_export_dir / 'tile_transforms.csv'}",
                 ]
             )
+        if self.step8_current_export_dir is not None:
+            lines.extend(
+                [
+                    f"- qc_selection_json: {selection_json}",
+                    f"- qc_selection_csv: {selection_csv}",
+                    f"- ribbon_annotation_json: {annotation_json}",
+                    f"- ribbon_analysis_json: {analysis_json}",
+                    f"- depth_profile_probe_manifest: {probe_manifest}",
+                ]
+            )
         self.step8_info.setPlainText("\n".join(lines))
+
+    def _default_step8_handoff_root(self) -> Path:
+        roi_root = self._default_step7_confocal_roi_root()
+        if roi_root is not None and roi_root.exists():
+            return roi_root
+        preferred = self._preferred_existing_path(r"D:\Research\Image Analysis\Confocal Myelin data\202512_8rats_3ROIs")
+        if preferred is not None:
+            return preferred
+        return self._default_step7_confocal_root()
+
+    def _step8_selection_json_path(self, export_dir: Path) -> Path:
+        return Path(export_dir) / "step8_tile_selection_qc.json"
+
+    def _step8_selection_csv_path(self, export_dir: Path) -> Path:
+        return Path(export_dir) / "step8_tile_selection_qc.csv"
+
+    def _default_step8_prediction_root(self) -> Path | None:
+        preferred = self._preferred_existing_path(
+            r"D:\Research\Image Analysis\Confocal Myelin data\Inference\2026-04-10_3d_vanilla_corrected202512_221055_3d_vanilla_corrected202512\predictions\corrected202512_632stacks_final_merged_20260415"
+        )
+        if preferred is not None:
+            return preferred
+        inference_root = self._preferred_existing_path(r"D:\Research\Image Analysis\Confocal Myelin data\Inference")
+        if inference_root is None or not inference_root.exists():
+            return None
+        matches = sorted(inference_root.glob("**/predictions/*final_merged*"), reverse=True)
+        return matches[0] if matches else None
+
+    def _step8_ribbon_annotation_json_path(self, export_dir: Path) -> Path:
+        return Path(export_dir) / "step8_ribbon_annotation.json"
+
+    def _step8_ribbon_analysis_json_path(self, export_dir: Path) -> Path:
+        return Path(export_dir) / "step8_ribbon_analysis.json"
+
+    def _step8_depth_profile_probe_annotation_json_path(self, export_dir: Path) -> Path:
+        return Path(export_dir) / "step8_depth_profile_probe_annotation.json"
+
+    def _load_step8_saved_depth_profile_probe_annotations(self, export_dir: Path) -> list[dict[str, object]]:
+        path = self._step8_depth_profile_probe_annotation_json_path(export_dir)
+        if not path.exists():
+            return []
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        return [dict(row) for row in list(payload.get("probes") or []) if isinstance(row, dict)]
+
+    def _step8_default_include_for_row(self, row: dict[str, object]) -> bool:
+        state = str(row.get("tile_state") or "").strip().lower()
+        return bool(
+            state in {"accepted", "frozen"}
+            or bool(row.get("accepted"))
+            or bool(row.get("frozen"))
+        )
+
+    def _load_step8_saved_selection_map(self, export_dir: Path) -> dict[int, bool]:
+        path = self._step8_selection_json_path(export_dir)
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        out: dict[int, bool] = {}
+        rows = payload.get("rows") if isinstance(payload, dict) else None
+        if isinstance(rows, list):
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    idx = int(row.get("tile_index"))
+                except Exception:
+                    continue
+                out[idx] = bool(row.get("include_for_stats", False))
+            return out
+        included = payload.get("included_tile_indices") if isinstance(payload, dict) else None
+        if isinstance(included, list):
+            include_set = {int(v) for v in included}
+            excluded = payload.get("excluded_tile_indices") if isinstance(payload, dict) else []
+            excluded_set = {int(v) for v in excluded} if isinstance(excluded, list) else set()
+            for idx in include_set:
+                out[int(idx)] = True
+            for idx in excluded_set:
+                out[int(idx)] = False
+        return out
+
+    def _step8_saved_selection_counts(self, export_dir: Path, tile_count: int) -> tuple[int | None, int]:
+        sel = self._load_step8_saved_selection_map(export_dir)
+        if not sel:
+            return None, int(tile_count)
+        included = sum(1 for v in sel.values() if bool(v))
+        return int(included), int(tile_count)
+
+    def _resolve_step8_export_dir(self, handoff_path: Path, payload: dict[str, object]) -> Path:
+        export_dir_raw = str(payload.get("step7_export_dir") or handoff_path.parent)
+        preferred = self._preferred_existing_path(export_dir_raw)
+        if preferred is not None:
+            return preferred
+        return Path(export_dir_raw)
+
+    def _discover_step8_export_candidates(self) -> list[dict[str, object]]:
+        root = self.step8_handoff_root if self.step8_handoff_root is not None else self._default_step8_handoff_root()
+        candidates: list[dict[str, object]] = []
+        if root is None or not root.exists():
+            return candidates
+        for roi_dir in sorted([p for p in root.iterdir() if p.is_dir() and not p.name.startswith("_")]):
+            exports = sorted(
+                [d for d in roi_dir.glob("step7_session_export_*") if (d / "step8_handoff.json").exists()],
+                reverse=True,
+            )
+            if not exports:
+                continue
+            export_dir = exports[0]
+            handoff_path = export_dir / "step8_handoff.json"
+            tile_count = 0
+            myelin_label = roi_dir.name
+            saved_at = ""
+            try:
+                payload = load_step7_handoff_payload(handoff_path)
+                tile_count = len(list(payload.get("tile_records") or []))
+                myelin_label = str(payload.get("myelin_label") or roi_dir.name)
+                saved_at = str(payload.get("saved_at_utc") or "")
+            except Exception:
+                payload = None
+            saved_included, saved_total = self._step8_saved_selection_counts(export_dir, tile_count)
+            qc_text = (
+                f"qc {saved_included}/{saved_total}"
+                if saved_included is not None
+                else f"{tile_count} tiles"
+            )
+            display = f"{str(myelin_label).replace('(maybe_bad)', '').strip()} | {qc_text}"
+            candidates.append(
+                {
+                    "roi_folder": roi_dir.name,
+                    "display_roi": str(myelin_label).replace("(maybe_bad)", "").strip(),
+                    "display_text": display,
+                    "export_dir": export_dir,
+                    "handoff_path": handoff_path,
+                    "saved_at_utc": saved_at,
+                    "tile_count": int(tile_count),
+                }
+            )
+        current_path = self.step8_current_handoff_path
+        if current_path is not None and current_path.exists():
+            current_key = str(current_path.resolve())
+            if all(str(Path(c["handoff_path"]).resolve()) != current_key for c in candidates):
+                export_dir = current_path.parent
+                candidates.insert(
+                    0,
+                    {
+                        "roi_folder": export_dir.parent.name,
+                        "display_roi": export_dir.parent.name.replace("(maybe_bad)", "").strip(),
+                        "display_text": f"{export_dir.parent.name.replace('(maybe_bad)', '').strip()} | manual",
+                        "export_dir": export_dir,
+                        "handoff_path": current_path,
+                        "saved_at_utc": "",
+                        "tile_count": 0,
+                    },
+                )
+        return candidates
+
+    def refresh_step8_exports(self) -> None:
+        self.step8_handoff_root = self._default_step8_handoff_root()
+        self.step8_export_candidates = self._discover_step8_export_candidates()
+        blocker = QSignalBlocker(self.step8_export_list)
+        self.step8_export_list.clear()
+        for cand in self.step8_export_candidates:
+            item = QListWidgetItem(str(cand.get("display_text") or "unknown"))
+            item.setToolTip(str(cand.get("handoff_path") or ""))
+            self.step8_export_list.addItem(item)
+        del blocker
+        self._sync_step8_export_list_selection()
+        self._refresh_step8_info()
+
+    def _sync_step8_export_list_selection(self) -> None:
+        target_path: Path | None = None
+        if self.step8_current_handoff_path is not None and self.step8_current_handoff_path.exists():
+            target_path = self.step8_current_handoff_path
+        elif self.step7_last_export_dir is not None:
+            probe = self.step7_last_export_dir / "step8_handoff.json"
+            if probe.exists():
+                target_path = probe
+        target_key = str(target_path.resolve()) if target_path is not None and target_path.exists() else None
+        match_idx: int | None = None
+        for i, cand in enumerate(self.step8_export_candidates):
+            handoff_path = Path(cand["handoff_path"])
+            try:
+                cand_key = str(handoff_path.resolve())
+            except Exception:
+                cand_key = str(handoff_path)
+            if target_key is not None and cand_key == target_key:
+                match_idx = i
+                break
+        if match_idx is None and self.step8_export_candidates:
+            match_idx = 0
+        if match_idx is not None:
+            blocker = QSignalBlocker(self.step8_export_list)
+            self.step8_export_list.setCurrentRow(match_idx)
+            del blocker
+
+    def on_step8_export_candidate_changed(self, _index: int) -> None:
+        self._refresh_step8_info()
+
+    def load_selected_step8_export(self) -> None:
+        idx = int(self.step8_export_list.currentRow())
+        if idx < 0 or idx >= len(self.step8_export_candidates):
+            return
+        handoff_path = Path(self.step8_export_candidates[idx]["handoff_path"])
+        self._load_step8_handoff_into_gui(handoff_path)
+
+    def load_latest_step8_export(self) -> None:
+        if self.step7_last_export_dir is not None:
+            direct = self.step7_last_export_dir / "step8_handoff.json"
+            if direct.exists():
+                self._load_step8_handoff_into_gui(direct)
+                return
+        if not self.step8_export_candidates:
+            self.refresh_step8_exports()
+        if not self.step8_export_candidates:
+            return
+        latest = max(
+            self.step8_export_candidates,
+            key=lambda row: (Path(row["handoff_path"]).stat().st_mtime if Path(row["handoff_path"]).exists() else 0.0, str(row["handoff_path"])),
+        )
+        self._load_step8_handoff_into_gui(Path(latest["handoff_path"]))
+
+    def load_step8_handoff_dialog(self) -> None:
+        start_dir = str(self.step8_current_handoff_path.parent) if self.step8_current_handoff_path is not None else str(self._default_step8_handoff_root())
+        chosen, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Step 8 Handoff JSON",
+            start_dir,
+            "Step 8 handoff (step8_handoff.json *.json);;JSON (*.json)",
+        )
+        if not chosen:
+            return
+        self._load_step8_handoff_into_gui(Path(chosen))
+
+    def _load_step8_handoff_into_gui(self, handoff_path: Path) -> None:
+        try:
+            payload = load_step7_handoff_payload(handoff_path)
+        except Exception as exc:
+            QMessageBox.warning(self, "Load Step 8 Handoff", f"Could not load Step 8 handoff:\n{handoff_path}\n\n{exc}")
+            return
+        export_dir = self._resolve_step8_export_dir(handoff_path, payload)
+        scene_shape = tuple(payload.get("scene_space", {}).get("fixed_preview_shape_hw") or [512, 512])
+        scene_h = max(1, int(scene_shape[0]))
+        scene_w = max(1, int(scene_shape[1]))
+        base_scene = np.full((scene_h, scene_w, 3), 245, dtype=np.uint8)
+        base_path = export_dir / "reference" / "myelin_fixed_preview.png"
+        base_scene_path: Path | None = None
+        if base_path.exists():
+            loaded = cv2.imread(str(base_path), cv2.IMREAD_COLOR)
+            if loaded is not None:
+                base_scene = cv2.cvtColor(loaded, cv2.COLOR_BGR2RGB)
+                base_scene_path = base_path
+        detail_scene = np.asarray(base_scene, dtype=np.uint8).copy()
+        overlay_qc_raw = (
+            ((payload.get("prediction_import") or {}).get("files") or {}).get("step8_overlay_qc")
+            if isinstance(payload.get("prediction_import"), dict)
+            else ""
+        )
+        overlay_qc_path = self._preferred_existing_path(str(overlay_qc_raw)) if overlay_qc_raw else None
+        if overlay_qc_path is not None and overlay_qc_path.exists():
+            loaded = cv2.imread(str(overlay_qc_path), cv2.IMREAD_COLOR)
+            if loaded is not None:
+                detail_scene = cv2.cvtColor(loaded, cv2.COLOR_BGR2RGB)
+        else:
+            preview_scene_path = export_dir / "preview_scene_full.png"
+            if preview_scene_path.exists():
+                loaded = cv2.imread(str(preview_scene_path), cv2.IMREAD_COLOR)
+                if loaded is not None:
+                    detail_scene = cv2.cvtColor(loaded, cv2.COLOR_BGR2RGB)
+        rows = [dict(row) for row in list(payload.get("tile_records") or []) if isinstance(row, dict)]
+        rows.sort(key=lambda row: (int(row.get("row_display", 9999)), int(row.get("col_display", 9999)), int(row.get("tile_index", 9999))))
+        default_include = {int(row.get("tile_index", -1)): self._step8_default_include_for_row(row) for row in rows}
+        saved_include = self._load_step8_saved_selection_map(export_dir)
+        include_map = dict(default_include)
+        include_map.update({idx: bool(val) for idx, val in saved_include.items() if idx in include_map})
+        self.step8_current_handoff_path = handoff_path
+        self.step8_current_export_dir = export_dir
+        self.step8_current_handoff = payload
+        self.step8_prediction_root = self._default_step8_prediction_root()
+        self.step8_scene_base_rgb = np.asarray(base_scene, dtype=np.uint8).copy()
+        self.step8_scene_detail_rgb = np.asarray(detail_scene, dtype=np.uint8).copy()
+        self.step8_scene_base_path = base_scene_path
+        self.step8_tile_rows = rows
+        self.step8_tile_row_by_index = {int(row.get("tile_index", -1)): row for row in rows}
+        self.step8_tile_include_map = include_map
+        self.step8_selection_dirty = False
+        self.step8_annotation_dirty = False
+        self.step8_ribbon_analysis_payload = None
+        self.step8_ribbon_result_files = {}
+        self.step8_probe_payload = None
+        self.step8_probe_result_files = {}
+        first_included = next((int(row.get("tile_index", -1)) for row in rows if include_map.get(int(row.get("tile_index", -1)), False)), None)
+        self.step8_current_tile_index = first_included if first_included is not None else (int(rows[0].get("tile_index", -1)) if rows else None)
+        self._populate_step8_tile_list()
+        saved_annotation = load_step8_saved_ribbon_annotation(export_dir)
+        self.step8_surface_points_scene_xy = []
+        self.step8_interface_points_scene_xy = []
+        if isinstance(saved_annotation, dict):
+            self.step8_surface_points_scene_xy = [
+                (float(pt[0]), float(pt[1]))
+                for pt in list(saved_annotation.get("surface_points_scene_xy") or [])
+                if isinstance(pt, (list, tuple)) and len(pt) >= 2
+            ]
+            self.step8_interface_points_scene_xy = [
+                (float(pt[0]), float(pt[1]))
+                for pt in list(saved_annotation.get("interface_points_scene_xy") or [])
+                if isinstance(pt, (list, tuple)) and len(pt) >= 2
+            ]
+        self.step8_current_curve_mode = None
+        self.step8_overview_view.set_active_curve(None)
+        self.step8_overview_view.set_curve_points("surface", self.step8_surface_points_scene_xy)
+        self.step8_overview_view.set_curve_points("interface", self.step8_interface_points_scene_xy)
+        self.step8_saved_probe_annotations = self._load_step8_saved_depth_profile_probe_annotations(export_dir)
+        self.step8_overview_view.set_saved_probes(self.step8_saved_probe_annotations)
+        self.step8_annotation_dirty = False
+        self._render_step8_overview()
+        self._render_step8_selected_tile_detail()
+        self._load_step8_saved_ribbon_outputs()
+        self._refresh_step8_selection_summary()
+        self._refresh_step8_selected_tile_info()
+        self.refresh_step8_exports()
+
+    def _load_step8_saved_ribbon_outputs(self) -> None:
+        if self.step8_current_export_dir is None:
+            self.step8_ribbon_analysis_payload = None
+            self.step8_ribbon_result_files = {}
+            self.step8_profile_view.clear_all()
+            return
+        analysis = load_step8_saved_ribbon_analysis(self.step8_current_export_dir)
+        self.step8_ribbon_analysis_payload = analysis if isinstance(analysis, dict) else None
+        files = {
+            "ribbon_qc_png": str(self.step8_current_export_dir / "step8_ribbon_qc.png"),
+            "depth_field_png": str(self.step8_current_export_dir / "step8_ribbon_depth_field.png"),
+            "ribbon_heatmap_png": str(self.step8_current_export_dir / "step8_ribbon_heatmap.png"),
+            "profile_png": str(self.step8_current_export_dir / "step8_ribbon_profile.png"),
+        }
+        self.step8_ribbon_result_files = files
+        profile_path = Path(files["profile_png"])
+        if profile_path.exists():
+            loaded = cv2.imread(str(profile_path), cv2.IMREAD_COLOR)
+            if loaded is not None:
+                self._set_image_scene_view_rgb(self.step8_profile_view, cv2.cvtColor(loaded, cv2.COLOR_BGR2RGB), preserve_view=False)
+                return
+        self.step8_profile_view.clear_all()
+
+    def on_step8_annotation_curves_changed(self, snapshot: object) -> None:
+        if not isinstance(snapshot, dict):
+            return
+        self.step8_surface_points_scene_xy = [
+            (float(pt[0]), float(pt[1]))
+            for pt in list(snapshot.get("surface") or [])
+            if isinstance(pt, (list, tuple)) and len(pt) >= 2
+        ]
+        self.step8_interface_points_scene_xy = [
+            (float(pt[0]), float(pt[1]))
+            for pt in list(snapshot.get("interface") or [])
+            if isinstance(pt, (list, tuple)) and len(pt) >= 2
+        ]
+        self.step8_annotation_dirty = True
+        self._refresh_step8_selection_summary()
+        self._refresh_step8_info()
+
+    def step8_activate_grab_mode(self) -> None:
+        self.step8_current_curve_mode = None
+        self.step8_overview_view.set_probe_mode(False)
+        self.step8_overview_view.set_active_curve(None)
+        self._refresh_step8_selection_summary()
+
+    def step8_activate_curve_mode(self, name: str) -> None:
+        if name not in {"surface", "interface"}:
+            return
+        self.step8_current_curve_mode = str(name)
+        self.step8_overview_view.set_probe_mode(False)
+        self.step8_overview_view.set_active_curve(str(name))
+        self._refresh_step8_selection_summary()
+
+    def step8_finish_curve_mode(self) -> None:
+        self.step8_current_curve_mode = None
+        self.step8_overview_view.set_active_curve(None)
+        self._refresh_step8_selection_summary()
+
+    def step8_undo_current_curve_point(self) -> None:
+        self.step8_overview_view.undo_last_point(self.step8_current_curve_mode)
+
+    def step8_clear_curve(self, name: str) -> None:
+        self.step8_overview_view.clear_curve(str(name))
+
+    def on_step8_probe_changed(self, snapshot: object) -> None:
+        self.step8_probe_payload = dict(snapshot) if isinstance(snapshot, dict) else None
+        self._refresh_step8_selection_summary()
+        self._refresh_step8_info()
+
+    def step8_activate_probe_mode(self) -> None:
+        self.step8_current_curve_mode = None
+        self.step8_overview_view.set_active_curve(None)
+        self.step8_overview_view.set_probe_mode(True)
+        self.step8_probe_payload = self.step8_overview_view.probe_snapshot()
+        self._refresh_step8_selection_summary()
+        self._refresh_step8_info()
+
+    def step8_clear_probe(self) -> None:
+        self.step8_overview_view.clear_probe()
+        self.step8_probe_payload = self.step8_overview_view.probe_snapshot()
+        self._refresh_step8_info()
+
+    def step8_reverse_probe_depth(self) -> None:
+        self.step8_overview_view.reverse_probe_depth()
+        self.step8_probe_payload = self.step8_overview_view.probe_snapshot()
+        self._refresh_step8_info()
+
+    def load_step8_saved_depth_profile_probes(self) -> None:
+        if self.step8_current_export_dir is None:
+            QMessageBox.information(self, "Load Depth Profile Probes", "Load a Step 8 handoff first.")
+            return
+        self.step8_saved_probe_annotations = self._load_step8_saved_depth_profile_probe_annotations(self.step8_current_export_dir)
+        self.step8_overview_view.set_saved_probes(self.step8_saved_probe_annotations)
+        self._render_step8_overview()
+        self._refresh_step8_info()
+        QMessageBox.information(self, "Load Depth Profile Probes", f"Loaded {len(self.step8_saved_probe_annotations)} saved probe(s).")
+
+    def _next_step8_probe_id(self) -> str:
+        existing = {str(row.get("probe_id") or "") for row in self.step8_saved_probe_annotations}
+        idx = 1
+        while f"probe_{idx:03d}" in existing:
+            idx += 1
+        return f"probe_{idx:03d}"
+
+    def compute_step8_depth_profile_probe_current_export(self) -> None:
+        if self.step8_current_export_dir is None or self.step8_scene_base_rgb is None:
+            QMessageBox.information(self, "Depth Profile Probe", "Load a Step 8 handoff before computing a probe.")
+            return
+        payload = dict(self.step8_probe_payload or self.step8_overview_view.probe_snapshot())
+        if not bool(payload.get("complete")):
+            QMessageBox.warning(self, "Depth Profile Probe", "Draw a complete probe first: depth axis, then width.")
+            return
+        note = self.step8_probe_note_edit.text().strip() if hasattr(self, "step8_probe_note_edit") else ""
+        probe_id = self._next_step8_probe_id()
+        handoff = self.step8_current_handoff if isinstance(self.step8_current_handoff, dict) else {}
+        scene_um_per_px = handoff.get("fixed_preview_um_per_px_xy")
+        if not (isinstance(scene_um_per_px, (list, tuple)) and len(scene_um_per_px) >= 2):
+            scene_space = handoff.get("scene_space") if isinstance(handoff.get("scene_space"), dict) else {}
+            working_um = scene_space.get("working_um_per_px")
+            try:
+                scene_um_per_px = [float(working_um), float(working_um)]
+            except Exception:
+                scene_um_per_px = None
+        try:
+            result = compute_step8_depth_profile_probe(
+                scene_rgb=self.step8_scene_base_rgb,
+                probe_payload=payload,
+                probe_id=probe_id,
+                source_image_path=str(self.step8_scene_base_path or ""),
+                scene_um_per_px_xy=scene_um_per_px,
+                depth_samples=int(self.step8_probe_depth_samples_spin.value()),
+                window_fraction=float(self.step8_probe_window_fraction_spin.value()),
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Depth Profile Probe", f"Could not compute depth profile probe:\n\n{exc}")
+            return
+        if note:
+            result.annotation_payload["note"] = note
+        saved = save_step8_depth_profile_probe_result(self.step8_current_export_dir, result)
+        self.step8_probe_result_files = saved
+        self.step8_saved_probe_annotations = self._load_step8_saved_depth_profile_probe_annotations(self.step8_current_export_dir)
+        self.step8_overview_view.set_saved_probes(self.step8_saved_probe_annotations)
+        self._set_image_scene_view_rgb(self.step8_selected_tile_view, result.crop_annotated_rgb, preserve_view=False)
+        self._set_image_scene_view_rgb(self.step8_profile_view, result.profile_plot_rgb, preserve_view=False)
+        self._refresh_step8_selection_summary()
+        self._refresh_step8_info()
+        QMessageBox.information(
+            self,
+            "Depth Profile Probe",
+            "\n".join(
+                [
+                    "Saved depth profile probe:",
+                    saved.get("manifest_json", ""),
+                    saved.get("profiles_csv", ""),
+                    saved.get("windows_csv", ""),
+                ]
+            ),
+        )
+
+    def save_step8_ribbon_annotation_only(self) -> None:
+        if self.step8_current_export_dir is None or self.step8_current_handoff_path is None:
+            QMessageBox.information(self, "Save Ribbon QC", "Load a Step 8 handoff before saving ribbon annotations.")
+            return
+        if len(self.step8_surface_points_scene_xy) < 2 or len(self.step8_interface_points_scene_xy) < 2:
+            QMessageBox.warning(self, "Save Ribbon QC", "Draw both the surface and WM/GM interface before saving.")
+            return
+        payload = {
+            "schema": "step8_ribbon_annotation_v1",
+            "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+            "step7_export_dir": str(self.step8_current_export_dir),
+            "step8_handoff_path": str(self.step8_current_handoff_path),
+            "myelin_label": str((self.step8_current_handoff or {}).get("myelin_label") or self.step8_current_export_dir.parent.name),
+            "surface_points_scene_xy": [[float(x), float(y)] for x, y in self.step8_surface_points_scene_xy],
+            "interface_points_scene_xy": [[float(x), float(y)] for x, y in self.step8_interface_points_scene_xy],
+            "analysis_params": {
+                "tangent_samples": 256,
+                "depth_samples": 128,
+                "max_scene_edge": 1024,
+            },
+        }
+        path = self._step8_ribbon_annotation_json_path(self.step8_current_export_dir)
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self.step8_annotation_dirty = False
+        self._refresh_step8_selection_summary()
+        self._refresh_step8_info()
+        QMessageBox.information(self, "Save Ribbon QC", f"Saved Step 8 ribbon annotation:\n{path}")
+
+    def compute_step8_ribbon_current_export(self) -> None:
+        if self.step8_current_export_dir is None or self.step8_current_handoff_path is None or self.step8_scene_base_rgb is None:
+            QMessageBox.information(self, "Compute Ribbon", "Load a Step 8 handoff before computing ribbon analysis.")
+            return
+        if len(self.step8_surface_points_scene_xy) < 2 or len(self.step8_interface_points_scene_xy) < 2:
+            QMessageBox.warning(self, "Compute Ribbon", "Draw both the surface and WM/GM interface first.")
+            return
+        try:
+            result = compute_step8_ribbon_analysis(
+                handoff_path=self.step8_current_handoff_path,
+                scene_rgb=self.step8_scene_base_rgb,
+                tile_rows=self.step8_tile_rows,
+                include_map=self.step8_tile_include_map,
+                surface_points_scene_xy=self.step8_surface_points_scene_xy,
+                interface_points_scene_xy=self.step8_interface_points_scene_xy,
+                prediction_root=self.step8_prediction_root,
+                tangent_samples=256,
+                depth_samples=128,
+                max_scene_edge=1024,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Compute Ribbon", f"Could not compute ribbon analysis:\n\n{exc}")
+            return
+        saved = save_step8_ribbon_result(self.step8_current_export_dir, result)
+        self.step8_annotation_dirty = False
+        self.step8_ribbon_analysis_payload = result.analysis_payload
+        self.step8_ribbon_result_files = saved
+        self._set_image_scene_view_rgb(self.step8_selected_tile_view, result.qc_rgb, preserve_view=False)
+        self._set_image_scene_view_rgb(self.step8_profile_view, result.profile_rgb, preserve_view=False)
+        self._refresh_step8_selection_summary()
+        self._refresh_step8_selected_tile_info()
+        self._refresh_step8_info()
+        QMessageBox.information(self, "Compute Ribbon", f"Saved Step 8 ribbon analysis:\n{saved.get('analysis_json','')}")
+
+    def run_step8_groupwise_depth_comparison(self) -> None:
+        if self.step8_current_handoff is None or self.step8_current_export_dir is None:
+            QMessageBox.information(self, "Groupwise Depth Comparison", "Load a Step 8 handoff first.")
+            return
+        roi_suffix = str((self.step8_current_handoff.get("myelin_label") or self.step8_current_export_dir.parent.name)).replace("(maybe_bad)", "").strip().rsplit("_", 1)[-1]
+        analyses: list[dict[str, object]] = []
+        for cand in self.step8_export_candidates:
+            export_dir = Path(cand["export_dir"])
+            analysis = load_step8_saved_ribbon_analysis(export_dir)
+            if isinstance(analysis, dict):
+                analyses.append(analysis)
+        try:
+            result = compute_groupwise_depth_aligned_comparison(analyses, roi_suffix=roi_suffix)
+        except Exception as exc:
+            QMessageBox.warning(self, "Groupwise Depth Comparison", f"Could not compute groupwise depth comparison:\n\n{exc}")
+            return
+        plot_rgb = np.asarray(result["plot_rgb"], dtype=np.uint8)
+        self._set_image_scene_view_rgb(self.step8_profile_view, plot_rgb, preserve_view=False)
+        payload = dict(result["payload"])
+        png_path = self.step8_current_export_dir / f"step8_groupwise_depth_comparison_{roi_suffix.upper()}.png"
+        json_path = self.step8_current_export_dir / f"step8_groupwise_depth_comparison_{roi_suffix.upper()}.json"
+        cv2.imwrite(str(png_path), cv2.cvtColor(plot_rgb, cv2.COLOR_RGB2BGR))
+        json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self._refresh_step8_info()
+        QMessageBox.information(self, "Groupwise Depth Comparison", f"Saved groupwise comparison:\n{png_path}\n{json_path}")
+
+    def _populate_step8_tile_list(self) -> None:
+        self._step8_tile_list_updating = True
+        self.step8_tile_item_by_index.clear()
+        blocker = QSignalBlocker(self.step8_tile_list)
+        self.step8_tile_list.clear()
+        current_item: QListWidgetItem | None = None
+        for row in self.step8_tile_rows:
+            idx = int(row.get("tile_index", -1))
+            state = str(row.get("tile_state") or "unknown")
+            text = (
+                f"{str(row.get('label') or f'T{idx:02d}')} | "
+                f"state={state} | r{int(row.get('row_display', -1))} c{int(row.get('col_display', -1))}"
+            )
+            item = QListWidgetItem(text)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+            item.setCheckState(Qt.CheckState.Checked if self.step8_tile_include_map.get(idx, False) else Qt.CheckState.Unchecked)
+            item.setData(Qt.ItemDataRole.UserRole, idx)
+            self.step8_tile_list.addItem(item)
+            self.step8_tile_item_by_index[idx] = item
+            if self.step8_current_tile_index is not None and idx == int(self.step8_current_tile_index):
+                current_item = item
+        del blocker
+        if current_item is not None:
+            self.step8_tile_list.setCurrentItem(current_item)
+        elif self.step8_tile_list.count() > 0:
+            self.step8_tile_list.setCurrentRow(0)
+            first_item = self.step8_tile_list.currentItem()
+            if first_item is not None:
+                self.step8_current_tile_index = int(first_item.data(Qt.ItemDataRole.UserRole))
+        self._step8_tile_list_updating = False
+
+    def on_step8_current_tile_item_changed(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
+        if current is None:
+            self.step8_current_tile_index = None
+        else:
+            try:
+                self.step8_current_tile_index = int(current.data(Qt.ItemDataRole.UserRole))
+            except Exception:
+                self.step8_current_tile_index = None
+        self._render_step8_overview()
+        self._render_step8_selected_tile_detail()
+        self._refresh_step8_selected_tile_info()
+
+    def on_step8_tile_item_changed(self, item: QListWidgetItem) -> None:
+        if self._step8_tile_list_updating:
+            return
+        try:
+            idx = int(item.data(Qt.ItemDataRole.UserRole))
+        except Exception:
+            return
+        self.step8_tile_include_map[idx] = item.checkState() == Qt.CheckState.Checked
+        self.step8_selection_dirty = True
+        self._refresh_step8_selection_summary()
+        self._refresh_step8_selected_tile_info()
+        self._render_step8_overview()
+        self._render_step8_selected_tile_detail()
+        self._refresh_step8_info()
+
+    def _set_step8_selected_tile_items_checked(self, checked: bool) -> None:
+        items = list(self.step8_tile_list.selectedItems())
+        if not items and self.step8_tile_list.currentItem() is not None:
+            items = [self.step8_tile_list.currentItem()]
+        if not items:
+            return
+        self._step8_tile_list_updating = True
+        for item in items:
+            item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+            try:
+                idx = int(item.data(Qt.ItemDataRole.UserRole))
+            except Exception:
+                continue
+            self.step8_tile_include_map[idx] = bool(checked)
+        self._step8_tile_list_updating = False
+        self.step8_selection_dirty = True
+        self._refresh_step8_selection_summary()
+        self._refresh_step8_selected_tile_info()
+        self._render_step8_overview()
+        self._render_step8_selected_tile_detail()
+        self._refresh_step8_info()
+
+    def _set_step8_all_tile_items_checked(self, checked: bool) -> None:
+        self._step8_tile_list_updating = True
+        for idx, item in self.step8_tile_item_by_index.items():
+            item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+            self.step8_tile_include_map[int(idx)] = bool(checked)
+        self._step8_tile_list_updating = False
+        self.step8_selection_dirty = True
+        self._refresh_step8_selection_summary()
+        self._refresh_step8_selected_tile_info()
+        self._render_step8_overview()
+        self._render_step8_selected_tile_detail()
+        self._refresh_step8_info()
+
+    def reset_step8_tile_qc_to_default(self) -> None:
+        if self.step8_current_export_dir is None:
+            return
+        self._step8_tile_list_updating = True
+        for row in self.step8_tile_rows:
+            idx = int(row.get("tile_index", -1))
+            include = self._step8_default_include_for_row(row)
+            self.step8_tile_include_map[idx] = include
+            item = self.step8_tile_item_by_index.get(idx)
+            if item is not None:
+                item.setCheckState(Qt.CheckState.Checked if include else Qt.CheckState.Unchecked)
+        self._step8_tile_list_updating = False
+        self.step8_selection_dirty = True
+        self._refresh_step8_selection_summary()
+        self._refresh_step8_selected_tile_info()
+        self._render_step8_overview()
+        self._render_step8_selected_tile_detail()
+        self._refresh_step8_info()
+
+    def save_step8_tile_qc_selection(self) -> None:
+        if self.step8_current_export_dir is None or self.step8_current_handoff_path is None:
+            QMessageBox.information(self, "Save Tile QC", "Load a Step 8 handoff before saving tile QC.")
+            return
+        json_path = self._step8_selection_json_path(self.step8_current_export_dir)
+        csv_path = self._step8_selection_csv_path(self.step8_current_export_dir)
+        rows_out: list[dict[str, object]] = []
+        for row in self.step8_tile_rows:
+            idx = int(row.get("tile_index", -1))
+            rows_out.append(
+                {
+                    "tile_index": idx,
+                    "label": str(row.get("label") or f"T{idx:02d}"),
+                    "row_display": int(row.get("row_display", -1)),
+                    "col_display": int(row.get("col_display", -1)),
+                    "tile_state": str(row.get("tile_state") or ""),
+                    "accepted": bool(row.get("accepted")),
+                    "frozen": bool(row.get("frozen")),
+                    "hold": bool(row.get("hold")),
+                    "frontier": bool(row.get("frontier")),
+                    "include_for_stats": bool(self.step8_tile_include_map.get(idx, False)),
+                }
+            )
+        included = sorted(int(row["tile_index"]) for row in rows_out if bool(row["include_for_stats"]))
+        excluded = sorted(int(row["tile_index"]) for row in rows_out if not bool(row["include_for_stats"]))
+        payload = {
+            "schema": "step8_tile_selection_qc_v1",
+            "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+            "step7_export_dir": str(self.step8_current_export_dir),
+            "step8_handoff_path": str(self.step8_current_handoff_path),
+            "myelin_label": str((self.step8_current_handoff or {}).get("myelin_label") or ""),
+            "summary": {
+                "tile_count": len(rows_out),
+                "included_count": len(included),
+                "excluded_count": len(excluded),
+            },
+            "included_tile_indices": included,
+            "excluded_tile_indices": excluded,
+            "rows": rows_out,
+        }
+        json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        with csv_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "tile_index",
+                    "label",
+                    "row_display",
+                    "col_display",
+                    "tile_state",
+                    "accepted",
+                    "frozen",
+                    "hold",
+                    "frontier",
+                    "include_for_stats",
+                ],
+            )
+            writer.writeheader()
+            writer.writerows(rows_out)
+        self.step8_selection_dirty = False
+        self.refresh_step8_exports()
+        self._refresh_step8_selection_summary()
+        self._refresh_step8_selected_tile_info()
+        self._refresh_step8_info()
+        QMessageBox.information(self, "Save Tile QC", f"Saved Step 8 tile selection QC:\n{json_path}\n{csv_path}")
+
+    def _capture_image_scene_view_state(self, view: ImageSceneView) -> dict[str, object] | None:
+        try:
+            center = view.mapToScene(view.viewport().rect().center())
+            return {
+                "center_scene_xy": [float(center.x()), float(center.y())],
+                "transform": view.transform(),
+            }
+        except Exception:
+            return None
+
+    def _restore_image_scene_view_state(self, view: ImageSceneView, state: dict[str, object] | None) -> None:
+        if not isinstance(state, dict):
+            return
+        transform = state.get("transform")
+        if transform is not None:
+            view.setTransform(transform)
+        center_xy = state.get("center_scene_xy")
+        if isinstance(center_xy, (list, tuple)) and len(center_xy) == 2:
+            view.centerOn(float(center_xy[0]), float(center_xy[1]))
+
+    def _set_image_scene_view_rgb(self, view: ImageSceneView, rgb: np.ndarray | None, *, preserve_view: bool) -> None:
+        if rgb is None:
+            view.clear_all()
+            return
+        state = self._capture_image_scene_view_state(view) if preserve_view else None
+        arr = np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8))
+        view.set_rgb_image(int(arr.shape[1]), int(arr.shape[0]), arr.tobytes())
+        if preserve_view and state is not None:
+            self._restore_image_scene_view_state(view, state)
+
+    def _step8_scene_polygon_for_row(self, row: dict[str, object]) -> np.ndarray | None:
+        bbox = row.get("final_scene_bbox_xyxy") or row.get("nominal_scene_bbox_xyxy") or row.get("pred_scene_bbox_xyxy")
+        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+            x0, y0, x1, y1 = [float(v) for v in bbox]
+            pts = np.asarray([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float32)
+            return np.round(pts).astype(np.int32)
+        poly = row.get("final_scene_polygon_xy") or row.get("nominal_scene_polygon_xy") or row.get("pred_scene_polygon_xy")
+        if isinstance(poly, (list, tuple)) and len(poly) >= 3:
+            pts = np.asarray(poly, dtype=np.float32)
+            if pts.ndim == 2 and pts.shape[1] >= 2:
+                return np.round(pts[:, :2]).astype(np.int32)
+        return None
+
+    def _render_step8_overview(self) -> None:
+        if self.step8_scene_base_rgb is None:
+            self.step8_overview_view.clear_all()
+            return
+        state = self.step8_overview_view.capture_view_state()
+        base = np.ascontiguousarray(np.asarray(self.step8_scene_base_rgb, dtype=np.uint8))
+        self.step8_overview_view.set_rgb_image(int(base.shape[1]), int(base.shape[0]), base.tobytes())
+        self.step8_overview_view.set_tile_overlay(
+            self.step8_tile_rows,
+            include_map=self.step8_tile_include_map,
+            current_tile_index=self.step8_current_tile_index,
+        )
+        self.step8_overview_view.set_curve_points("surface", self.step8_surface_points_scene_xy)
+        self.step8_overview_view.set_curve_points("interface", self.step8_interface_points_scene_xy)
+        self.step8_overview_view.set_saved_probes(self.step8_saved_probe_annotations)
+        self.step8_overview_view.set_active_curve(self.step8_current_curve_mode)
+        if state is not None:
+            self.step8_overview_view.restore_view_state(state)
+
+    def _render_step8_selected_tile_detail(self) -> None:
+        if self.step8_current_export_dir is not None:
+            qc_path = self.step8_current_export_dir / "step8_ribbon_qc.png"
+            if qc_path.exists():
+                loaded = cv2.imread(str(qc_path), cv2.IMREAD_COLOR)
+                if loaded is not None:
+                    self._set_image_scene_view_rgb(self.step8_selected_tile_view, cv2.cvtColor(loaded, cv2.COLOR_BGR2RGB), preserve_view=False)
+                    return
+        if self.step8_scene_detail_rgb is None or self.step8_current_tile_index is None:
+            self.step8_selected_tile_view.clear_all()
+            return
+        row = self.step8_tile_row_by_index.get(int(self.step8_current_tile_index))
+        if row is None:
+            self.step8_selected_tile_view.clear_all()
+            return
+        pts = self._step8_scene_polygon_for_row(row)
+        if pts is None:
+            self._set_image_scene_view_rgb(self.step8_selected_tile_view, self.step8_scene_detail_rgb, preserve_view=False)
+            return
+        base = np.asarray(self.step8_scene_detail_rgb, dtype=np.uint8).copy()
+        x0 = max(0, int(np.floor(np.min(pts[:, 0]))) - 140)
+        y0 = max(0, int(np.floor(np.min(pts[:, 1]))) - 140)
+        x1 = min(base.shape[1], int(np.ceil(np.max(pts[:, 0]))) + 140)
+        y1 = min(base.shape[0], int(np.ceil(np.max(pts[:, 1]))) + 140)
+        crop = base[y0:y1, x0:x1].copy()
+        for tile in self.step8_tile_rows:
+            t_idx = int(tile.get("tile_index", -1))
+            poly = self._step8_scene_polygon_for_row(tile)
+            if poly is None:
+                continue
+            bx0 = int(np.floor(np.min(poly[:, 0])))
+            by0 = int(np.floor(np.min(poly[:, 1])))
+            bx1 = int(np.ceil(np.max(poly[:, 0])))
+            by1 = int(np.ceil(np.max(poly[:, 1])))
+            if bx1 < x0 or bx0 > x1 or by1 < y0 or by0 > y1:
+                continue
+            local = poly.copy()
+            local[:, 0] -= x0
+            local[:, 1] -= y0
+            include = bool(self.step8_tile_include_map.get(t_idx, False))
+            color = (72, 176, 104) if include else (214, 86, 72)
+            thickness = 1
+            if t_idx == int(self.step8_current_tile_index):
+                color = (255, 208, 48)
+                thickness = 3
+            cv2.polylines(crop, [local], True, color, thickness, cv2.LINE_AA)
+        self._set_image_scene_view_rgb(self.step8_selected_tile_view, crop, preserve_view=False)
+
+    def _refresh_step8_selection_summary(self) -> None:
+        if not hasattr(self, "step8_selection_summary") or self.step8_selection_summary is None:
+            return
+        if self.step8_current_export_dir is None or self.step8_current_handoff is None:
+            self.step8_selection_summary.setText("No Step 7 handoff loaded")
+            return
+        total = len(self.step8_tile_rows)
+        included = sum(1 for v in self.step8_tile_include_map.values() if bool(v))
+        label = str((self.step8_current_handoff or {}).get("myelin_label") or self.step8_current_export_dir.parent.name)
+        dirty = "unsaved changes" if self.step8_selection_dirty else "saved / unchanged"
+        annotation_state = "unsaved changes" if self.step8_annotation_dirty else "saved / unchanged"
+        probe_state = "complete" if bool((self.step8_probe_payload or {}).get("complete")) else "not ready"
+        self.step8_selection_summary.setText(
+            "\n".join(
+                [
+                    f"ROI: {label.replace('(maybe_bad)', '').strip()}",
+                    f"Export: {self.step8_current_export_dir.name}",
+                    f"Included for stats: {included}/{total}",
+                    f"Tile QC state: {dirty}",
+                    f"Ribbon QC state: {annotation_state}",
+                    f"Surface points: {len(self.step8_surface_points_scene_xy)}",
+                    f"WM/GM interface points: {len(self.step8_interface_points_scene_xy)}",
+                    f"Draw mode: {self.step8_current_curve_mode or 'grab'}",
+                    f"Depth probe: {probe_state} | saved probes: {len(self.step8_saved_probe_annotations)}",
+                ]
+            )
+        )
+
+    def _refresh_step8_selected_tile_info(self) -> None:
+        if not hasattr(self, "step8_selected_tile_info") or self.step8_selected_tile_info is None:
+            return
+        if self.step8_current_tile_index is None:
+            self.step8_selected_tile_info.setPlainText("No tile selected.")
+            return
+        row = self.step8_tile_row_by_index.get(int(self.step8_current_tile_index))
+        if row is None:
+            self.step8_selected_tile_info.setPlainText("Selected tile metadata is unavailable.")
+            return
+        idx = int(row.get("tile_index", -1))
+        lines = [
+            f"label: {row.get('label') or f'T{idx:02d}'}",
+            f"tile_index: {idx}",
+            f"row_display: {int(row.get('row_display', -1))}",
+            f"col_display: {int(row.get('col_display', -1))}",
+            f"tile_state: {str(row.get('tile_state') or '')}",
+            f"include_for_stats: {bool(self.step8_tile_include_map.get(idx, False))}",
+            f"source_path: {row.get('source_path') or ''}",
+        ]
+        bbox = row.get("final_scene_bbox_xyxy")
+        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+            lines.append(f"final_scene_bbox_xyxy: {[float(v) for v in bbox]}")
+        full_bbox = row.get("final_full_crop_bbox_xyxy")
+        if isinstance(full_bbox, (list, tuple)) and len(full_bbox) == 4:
+            lines.append(f"final_full_crop_bbox_xyxy: {[float(v) for v in full_bbox]}")
+        if isinstance(self.step8_ribbon_analysis_payload, dict):
+            lines.extend(
+                [
+                    "",
+                    f"ribbon_selected_tile_count: {self.step8_ribbon_analysis_payload.get('selected_tile_count', '')}",
+                    f"ribbon_coverage_pixels: {self.step8_ribbon_analysis_payload.get('coverage_pixels', '')}",
+                    f"ribbon_depth_bins: {len(list(self.step8_ribbon_analysis_payload.get('depth_profile_probability') or []))}",
+                ]
+            )
+        self.step8_selected_tile_info.setPlainText("\n".join(lines))
 
     def _format_step7_current_tracker_lines(self) -> list[str]:
         snap = self.step7_preview_view.diagnostic_snapshot() if hasattr(self, "step7_preview_view") else {}
@@ -6439,6 +7632,50 @@ class WorkflowWindow(QWidget):
     def _step7_unfrozen_tile_order(self) -> list[int]:
         return [int(idx) for idx in self._step7_tile_order() if int(idx) not in self.step7_frozen_tile_indices]
 
+    def _step7_tile_has_qc_row(self, tile_index: int | None) -> bool:
+        row = self._step7_result_row_for_tile(tile_index)
+        if not isinstance(row, dict):
+            return False
+        return any(isinstance(row.get(key), np.ndarray) for key in ("moving", "fixed", "overlay", "heatmap"))
+
+    def _step7_neighbor_unfrozen_tile(
+        self,
+        current_tile_index: int | None,
+        *,
+        direction: int,
+        prefer_qc_row: bool = False,
+    ) -> int | None:
+        order = self._step7_tile_order()
+        if not order:
+            return None
+        unfrozen = set(self._step7_unfrozen_tile_order())
+        if not unfrozen:
+            return None
+        step = 1 if int(direction) >= 0 else -1
+
+        def _scan(require_qc_row: bool) -> int | None:
+            if current_tile_index is None or int(current_tile_index) not in order:
+                candidates = order if step > 0 else list(reversed(order))
+                return next(
+                    (
+                        int(idx)
+                        for idx in candidates
+                        if int(idx) in unfrozen and (not require_qc_row or self._step7_tile_has_qc_row(int(idx)))
+                    ),
+                    None,
+                )
+            start = order.index(int(current_tile_index))
+            for offset in range(1, len(order) + 1):
+                idx = int(order[(start + step * offset) % len(order)])
+                if idx in unfrozen and (not require_qc_row or self._step7_tile_has_qc_row(idx)):
+                    return idx
+            return None
+
+        next_idx = _scan(bool(prefer_qc_row))
+        if next_idx is None and prefer_qc_row:
+            next_idx = _scan(False)
+        return next_idx
+
     def _selected_step7_tile_indices_from_snapshot(self) -> list[int]:
         snap = self.step7_preview_view.diagnostic_snapshot() if hasattr(self, "step7_preview_view") else {}
         selected = snap.get("selected_tile_indices") if isinstance(snap, dict) else None
@@ -6619,28 +7856,18 @@ class WorkflowWindow(QWidget):
         self._set_rgb_image_label(self.step7_storyboard_label, rgb, "No selected tile QC yet")
 
     def select_prev_step7_tile(self) -> None:
-        order = self._step7_unfrozen_tile_order()
-        if not order:
-            return
         snap = self.step7_preview_view.diagnostic_snapshot()
         current = snap.get("selected_tile_index") if isinstance(snap, dict) else None
-        if current not in order:
-            self._set_step7_selected_tile(order[-1])
-            return
-        idx = order.index(int(current))
-        self._set_step7_selected_tile(order[(idx - 1) % len(order)])
+        prev_idx = self._step7_neighbor_unfrozen_tile(None if current is None else int(current), direction=-1)
+        if prev_idx is not None:
+            self._set_step7_selected_tile(prev_idx)
 
     def select_next_step7_tile(self) -> None:
-        order = self._step7_unfrozen_tile_order()
-        if not order:
-            return
         snap = self.step7_preview_view.diagnostic_snapshot()
         current = snap.get("selected_tile_index") if isinstance(snap, dict) else None
-        if current not in order:
-            self._set_step7_selected_tile(order[0])
-            return
-        idx = order.index(int(current))
-        self._set_step7_selected_tile(order[(idx + 1) % len(order)])
+        next_idx = self._step7_neighbor_unfrozen_tile(None if current is None else int(current), direction=1)
+        if next_idx is not None:
+            self._set_step7_selected_tile(next_idx)
 
     def accept_step7_selected_tile(self) -> None:
         snap = self.step7_preview_view.diagnostic_snapshot()
@@ -6671,6 +7898,8 @@ class WorkflowWindow(QWidget):
         selected_indices = self._selected_step7_tile_indices_from_snapshot()
         if not selected_indices:
             return
+        selected_idx = snap.get("selected_tile_index") if isinstance(snap, dict) else None
+        current_primary = None if selected_idx is None else int(selected_idx)
         selected_labels = [str(v) for v in list(snap.get("selected_tile_labels") or [])] if isinstance(snap, dict) else []
         all_selected_frozen = all(int(idx) in self.step7_frozen_tile_indices for idx in selected_indices)
         if all_selected_frozen:
@@ -6687,6 +7916,10 @@ class WorkflowWindow(QWidget):
             action_labels = selected_labels or [f"T{int(idx):02d}" for idx in selected_indices]
             self.step7_last_manual_action = f"tiles_frozen={','.join(action_labels)}"
         self._refresh_step7_preview_tile_states_only()
+        if not all_selected_frozen:
+            next_idx = self._step7_neighbor_unfrozen_tile(current_primary, direction=1, prefer_qc_row=True)
+            if next_idx is not None:
+                self._set_step7_selected_tile(next_idx)
         self._update_step7_info_text()
 
     def update_step7_preview(self, *, preserve_view: bool = False) -> None:
